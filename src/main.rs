@@ -581,19 +581,22 @@ fn main() -> Result<()> {
                 fs.fs_ipg
             };
 
+            let ino_size = if fs_v2 {
+                std::mem::size_of::<Ufs2Dinode>()
+            } else {
+                std::mem::size_of::<Ufs1Dinode>()
+            } as u32;
+
+            dbg!(inosused);
+
             for inumber in 0..inosused {
                 // TODO
-                let blk = fs.cgimin(fs.ino_to_cg(inumber as i32));
+                let blk = fs.ino_to_fsba(inumber as i32);
                 let blk_offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
 
-                let ino_size = if fs_v2 {
-                    std::mem::size_of::<Ufs2Dinode>()
-                } else {
-                    std::mem::size_of::<Ufs1Dinode>()
-                } as u32;
-
                 // TODO
-                let offset = blk_offset + ((inumber % fs.fs_ipg) * ino_size) as usize;
+                let offset =
+                    blk_offset + (fs.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
 
                 let ino = if fs_v2 {
                     let dinode: &Ufs2Dinode = unsafe { std::mem::transmute(&file[offset]) };
@@ -654,8 +657,8 @@ fn main() -> Result<()> {
                 }
 
                 eprintln!(
-                    "ino={}, ctime={}, mdoe={:0o}/{:0o}, size={}/{}",
-                    inumber, ino.di_ctime, mode, IFREG, ino.di_size, lndb
+                    "ino={}, ctime={}, mode={:0o}, size={}/{}",
+                    inumber, ino.di_ctime, mode, ino.di_size, lndb
                 );
 
                 let data = fs.read(&file, &ino);
@@ -702,7 +705,6 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            dbg!(inosused);
         }
     }
 
