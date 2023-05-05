@@ -515,7 +515,8 @@ struct Bufarea {
 }
 
 fn main() -> Result<()> {
-    let file = std::fs::read("test.img")?;
+    let filepath = std::env::args().nth(1).expect("usage: cmd <file>");
+    let file = std::fs::read(filepath)?;
 
     for offset in SBLOCKSEARCH {
         if offset + SBSIZE >= file.len() {
