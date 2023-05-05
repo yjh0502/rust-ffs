@@ -1,6 +1,44 @@
 use anyhow::Result;
 
-// inode
+// dinode.h
+/* File permissions. */
+const IEXEC: usize = 0o000100; /* Executable. */
+const IWRITE: usize = 0o000200; /* Writeable. */
+const IREAD: usize = 0o000400; /* Readable. */
+const ISVTX: usize = 0o001000; /* Sticky bit. */
+const ISGID: usize = 0o002000; /* Set-gid. */
+const ISUID: usize = 0o004000; /* Set-uid. */
+
+/* File types. */
+const IFMT: usize = 0o170000; /* Mask of file type. */
+const IFIFO: usize = 0o010000; /* Named pipe (fifo). */
+const IFCHR: usize = 0o020000; /* Character device. */
+const IFDIR: usize = 0o040000; /* Directory file. */
+const IFBLK: usize = 0o060000; /* Block device. */
+const IFREG: usize = 0o100000; /* Regular file. */
+const IFLNK: usize = 0o120000; /* Symbolic link. */
+const IFSOCK: usize = 0o140000; /* UNIX domain socket. */
+const IFWHT: usize = 0o160000; /* Whiteout. */
+
+// dir.h
+const MAXDIRSIZE: usize = 0x7fffffff;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Direct {
+    d_ino: u32,    /* inode number of entry */
+    d_reclen: u16, /* length of this record */
+    d_type: u8,    /* file type, see below */
+    d_namlen: u8,  /* length of string in d_name */
+}
+
+const DIR_ROUNDUP: usize = 4;
+fn directsiz(len: u8) -> usize {
+    let len = len as usize;
+    (std::mem::size_of::<Direct>() + (len + 1) + 3) & (!3)
+}
+
+// inode.h
 
 const ROOTINO: usize = 2;
 const NXADDR: usize = 2;
@@ -8,6 +46,7 @@ const NDADDR: usize = 12;
 const NIADDR: usize = 3;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 union Ufs1DinodeU {
     oldids: [u16; 2], /*   4: Ffs: old user and group ids. */
     inumber: u32,     /*   4: Lfs: inode number. */
@@ -25,7 +64,7 @@ impl std::fmt::Debug for Ufs1DinodeU {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Ufs1Dinode {
     di_mode: u16,  /*   0: IFMT, permissions; see below. */
     di_nlink: i16, /*   2: File link count. */
@@ -48,7 +87,7 @@ struct Ufs1Dinode {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Default)]
 struct Ufs2Dinode {
     di_mode: u16,           /*   0: IFMT, permissions; see below. */
     di_nlink: i16,          /*   2: File link count. */
@@ -73,6 +112,36 @@ struct Ufs2Dinode {
     di_db: [i64; NDADDR],   /* 112: Direct disk blocks. */
     di_ib: [i64; NIADDR],   /* 208: Indirect disk blocks. */
     di_spare: [i64; 3],     /* 232: Reserved; currently unused */
+}
+
+impl From<Ufs1Dinode> for Ufs2Dinode {
+    fn from(ino: Ufs1Dinode) -> Ufs2Dinode {
+        Ufs2Dinode {
+            di_mode: ino.di_mode,
+            di_nlink: ino.di_nlink,
+            di_uid: ino.di_uid,
+            di_gid: ino.di_gid,
+            di_blksize: 0,
+            di_size: ino.di_size,
+            di_blocks: ino.di_blocks as u64,
+            di_atime: ino.di_atime as i64,
+            di_mtime: ino.di_mtime as i64,
+            di_ctime: ino.di_ctime as i64,
+            di_birthtime: 0,
+            di_mtimensec: ino.di_mtimensec,
+            di_atimensec: ino.di_atimensec,
+            di_ctimensec: ino.di_ctimensec,
+            di_birthnsec: 0,
+            di_gen: ino.di_gen as i32,
+            di_kernflags: 0,
+            di_flags: ino.di_flags,
+            di_extsize: 0,
+            di_extb: [0; NXADDR],
+            di_db: ino.di_db.map(|x| x as i64),
+            di_ib: ino.di_ib.map(|x| x as i64),
+            di_spare: [0; 3],
+        }
+    }
 }
 
 // cylinder group
@@ -399,6 +468,39 @@ impl Fs {
         */
 }
 
+// extra helpers
+impl Fs {
+    fn blk<'a, 'b>(&'a self, buf: &'b [u8], blk: i32, len: usize) -> &'b [u8] {
+        assert!(len <= self.fs_bsize as usize, "{}", len);
+        let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
+        assert!(offset + len <= buf.len());
+
+        &buf[offset..offset + len]
+    }
+
+    fn read(&self, buf: &[u8], ino: &Ufs2Dinode) -> Vec<u8> {
+        assert_eq!(ino.di_ib, [0, 0, 0]);
+
+        let mut out = Vec::with_capacity(ino.di_size as usize);
+
+        for i in 0..NDADDR {
+            let blk = ino.di_db[i];
+            if blk == 0 {
+                break;
+            }
+            let remain = ino.di_size as usize - out.len();
+            let read = remain.min(self.fs_bsize as usize);
+            out.extend_from_slice(self.blk(buf, blk as i32, read));
+
+            if out.len() == ino.di_size as usize {
+                break;
+            }
+        }
+
+        out
+    }
+}
+
 #[repr(C)]
 struct Bufarea {
     b_bno: usize,
@@ -465,7 +567,6 @@ fn main() -> Result<()> {
         assert_eq!(fs, fs_alt);
 
         // pass0
-
         for c in 0..fs.fs_ncg {
             let blk = fs.cgtod(c as i32);
             let offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
@@ -494,14 +595,112 @@ fn main() -> Result<()> {
                 // TODO
                 let offset = blk_offset + ((inumber % fs.fs_ipg) * ino_size) as usize;
 
-                let di_ctime = if fs_v2 {
+                let ino = if fs_v2 {
                     let dinode: &Ufs2Dinode = unsafe { std::mem::transmute(&file[offset]) };
-                    dinode.di_ctime
+                    *dinode
                 } else {
                     let dinode: &Ufs1Dinode = unsafe { std::mem::transmute(&file[offset]) };
-                    dinode.di_ctime as i64
+                    (*dinode).into()
                 };
-                eprintln!("ino={}, ctime={}", inumber, di_ctime);
+
+                let mode = ino.di_mode as usize & IFMT;
+                if ino.di_mode == 0 {
+                    let d = Ufs2Dinode::default();
+                    assert_eq!(d.di_db, ino.di_db);
+                    assert_eq!(d.di_ib, ino.di_ib);
+                    assert_eq!(d.di_mode, 0);
+                    assert_eq!(d.di_size, 0);
+                    continue;
+                }
+
+                assert!(ino.di_size <= fs.fs_maxfilesize);
+
+                if mode == IFDIR {
+                    assert!(ino.di_size <= MAXDIRSIZE as u64);
+                }
+
+                let lndb = (ino.di_size + fs.fs_bsize as u64 - 1) / fs.fs_bsize as u64;
+                assert!(lndb <= std::i32::MAX as u64);
+
+                let mut ndb = lndb;
+                if mode == IFBLK || mode == IFCHR {
+                    ndb += 1;
+                }
+                if mode == IFLNK {
+                    // TODO
+                    continue;
+                }
+
+                // direct blocks
+                for j in ndb..NDADDR as u64 {
+                    assert_eq!(ino.di_db[j as usize], 0);
+                }
+
+                // indirect blocks
+                {
+                    let mut nib = 0;
+                    let mut ndb = ndb - NDADDR as u64;
+                    while ndb > 0 {
+                        ndb = ndb / fs.fs_nindir as u64;
+                        nib += 1;
+                    }
+                    for j in nib..NIADDR {
+                        assert_eq!(ino.di_ib[j as usize], 0);
+                    }
+                }
+
+                if ino.di_nlink <= 0 {
+                    eprintln!("zero-link inode: ino={}", inumber);
+                }
+
+                eprintln!(
+                    "ino={}, ctime={}, mdoe={:0o}/{:0o}, size={}/{}",
+                    inumber, ino.di_ctime, mode, IFREG, ino.di_size, lndb
+                );
+
+                let data = fs.read(&file, &ino);
+                if mode == IFREG {
+                    if let Ok(s) = std::str::from_utf8(&data) {
+                        // eprintln!("content={}", s);
+                    }
+                } else {
+                    let mut offset = 0;
+                    while offset < ino.di_size as usize {
+                        assert!(
+                            offset + std::mem::size_of::<Direct>() <= data.len(),
+                            "{}/{}/{}",
+                            offset,
+                            ino.di_size,
+                            data.len()
+                        );
+
+                        let dp: &Direct = unsafe { std::mem::transmute(&data[offset]) };
+                        if dp.d_ino == 0 {
+                            break;
+                        }
+
+                        let sz = directsiz(dp.d_namlen);
+                        let namebuf: &[u8] = unsafe {
+                            let buf: *const u8 =
+                                std::mem::transmute(&data[offset + std::mem::size_of::<Direct>()]);
+                            std::slice::from_raw_parts(buf, dp.d_namlen as usize)
+                        };
+
+                        offset += sz;
+
+                        let filename = if let Ok(s) = std::str::from_utf8(&namebuf) {
+                            s
+                        } else {
+                            "???"
+                        };
+
+                        if filename == "." || filename == ".." {
+                            continue;
+                        }
+
+                        eprintln!("{}, {:?}, {}", filename, dp, sz);
+                    }
+                }
             }
             dbg!(inosused);
         }
