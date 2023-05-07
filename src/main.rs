@@ -1,4 +1,5 @@
 use anyhow::Result;
+use log::*;
 
 // dinode.h
 /* File permissions. */
@@ -563,7 +564,7 @@ impl Fs {
                 let blksfreemap = cg.blksfree(buf);
                 let bitmap = blksfreemap[bno >> 3];
 
-                println!(
+                info!(
                     "read_indir: c={}, blk={}/{}/{}, {:08b}, fraglen={}/{}",
                     c,
                     blk,
@@ -661,6 +662,8 @@ fn fs(buf: &[u8]) -> &Fs {
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
+
     let filepath = std::env::args().nth(1).expect("usage: cmd <file>");
     let file = std::fs::read(filepath)?;
 
@@ -668,7 +671,7 @@ fn main() -> Result<()> {
 
     let fs_v2 = fs.fs_magic == FS_UFS2_MAGIC;
 
-    eprintln!("sb={:?}", fs);
+    info!("sb={:?}", fs);
 
     // consistency check
     assert!(fs.fs_ncg >= 1);
@@ -697,7 +700,7 @@ fn main() -> Result<()> {
     let fs_alt: &Fs = unsafe { std::mem::transmute(&file[offset_alt]) };
 
     if fs != fs_alt {
-        eprintln!("superblock mismatch");
+        error!("superblock mismatch");
         // assert_eq!(fs, fs_alt);
     }
 
@@ -710,9 +713,9 @@ fn main() -> Result<()> {
 
         let inousedmap = cg.inosused(&file);
         let blksfreemap = cg.blksfree(&file);
-        eprintln!("cg #{}: {:?}", c, cg,);
-        eprintln!("inoused={}/{:?}", inousedmap.len(), inousedmap,);
-        eprintln!("blkfree={}/{:?}", blksfreemap.len(), blksfreemap,);
+        info!("cg #{}: {:?}", c, cg,);
+        debug!("inoused={}/{:?}", inousedmap.len(), inousedmap,);
+        debug!("blkfree={}/{:?}", blksfreemap.len(), blksfreemap,);
 
         let inosused = if fs_v2 {
             cg.cg_initediblk.min(fs.fs_ipg)
@@ -726,7 +729,6 @@ fn main() -> Result<()> {
             std::mem::size_of::<Ufs1Dinode>()
         } as u32;
 
-        dbg!(inosused);
         let ino_start = fs.fs_ipg * c;
         let ino_end = ino_start + inosused;
 
@@ -793,12 +795,12 @@ fn main() -> Result<()> {
             }
 
             if ino.di_nlink <= 0 {
-                eprintln!("zero-link inode: ino={}", inumber);
+                error!("zero-link inode: ino={}", inumber);
             }
 
             let data = fs.read(&file, &ino);
 
-            eprintln!(
+            debug!(
                 "ino={}, nlink={}, ctime={}, mode={:0o}, size={}/{}/{}",
                 inumber,
                 ino.di_nlink,
@@ -811,7 +813,7 @@ fn main() -> Result<()> {
 
             if mode == IFREG {
                 if let Ok(s) = std::str::from_utf8(&data) {
-                    // eprintln!("content={}", s);
+                    trace!("content={}", s);
                 }
             } else {
                 let dirblks = data.len() / DEV_BSIZE;
@@ -844,7 +846,7 @@ fn main() -> Result<()> {
                             continue;
                         }
 
-                        eprintln!("{}, {:?}, {}", filename, dp, sz);
+                        trace!("{}, {:?}, {}", filename, dp, sz);
                     }
                 }
             }
