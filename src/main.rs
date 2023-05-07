@@ -178,6 +178,47 @@ struct Cg {
                               /* actually longer */
 }
 
+impl Cg {
+    fn inosused(&self, cgoff: usize, buf: &[u8]) -> &[u8] {
+        let offset = cgoff + self.cg_iusedoff as usize;
+        let size = self.cg_niblk as usize / 8;
+        unsafe {
+            let ptr: *const u8 = &buf[offset];
+            std::slice::from_raw_parts(ptr, size)
+        }
+    }
+
+    fn blksfree(&self, cgoff: usize, buf: &[u8]) -> &[u8] {
+        let offset = cgoff + self.cg_freeoff as usize;
+        let size = self.cg_ndblk as usize / 8;
+        unsafe {
+            let ptr: *const u8 = &buf[offset];
+            std::slice::from_raw_parts(ptr, size)
+        }
+    }
+
+    /*
+     * Macros for access to cylinder group array structures
+     */
+    /*
+    #define cg_blktot(cgp) \
+        (((cgp)->cg_magic != CG_MAGIC) \
+        ? (((struct ocg *)(cgp))->cg_btot) \
+        : ((int32_t *)((u_int8_t *)(cgp) + (cgp)->cg_btotoff)))
+    #define cg_blks(fs, cgp, cylno) \
+        (((cgp)->cg_magic != CG_MAGIC) \
+        ? (((struct ocg *)(cgp))->cg_b[cylno]) \
+        : ((int16_t *)((u_int8_t *)(cgp) + \
+        (cgp)->cg_boff) + (cylno) * (fs)->fs_nrpos))
+    #define cg_chkmagic(cgp) \
+        ((cgp)->cg_magic == CG_MAGIC || ((struct ocg *)(cgp))->cg_magic == CG_MAGIC)
+    #define cg_clustersfree(cgp) \
+        ((u_int8_t *)((u_int8_t *)(cgp) + (cgp)->cg_clusteroff))
+    #define cg_clustersum(cgp) \
+        ((int32_t *)((u_int8_t *)(cgp) + (cgp)->cg_clustersumoff))
+    */
+}
+
 const DEV_BSHIFT: usize = 9;
 const DEV_BSIZE: usize = 1 << DEV_BSHIFT;
 
@@ -620,7 +661,12 @@ fn main() -> Result<()> {
 
         let cg: &Cg = unsafe { std::mem::transmute(&file[offset]) };
         assert_eq!(cg.cg_magic, CG_MAGIC);
-        eprintln!("cg #{}: {:?}", c, cg);
+
+        let inousedmap = cg.inosused(offset, &file);
+        let blksfreemap = cg.blksfree(offset, &file);
+        eprintln!("cg #{}: {:?}", c, cg,);
+        eprintln!("inoused={}/{:?}", inousedmap.len(), inousedmap,);
+        eprintln!("blkfree={}/{:?}", blksfreemap.len(), blksfreemap,);
 
         let inosused = if fs_v2 {
             cg.cg_initediblk.min(fs.fs_ipg)
