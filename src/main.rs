@@ -193,7 +193,7 @@ impl Cg {
     fn inosused(&self, buf: &[u8]) -> &[u8] {
         let cgoff = self.cgoff(buf);
         let offset = cgoff + self.cg_iusedoff as usize;
-        let size = self.cg_niblk as usize / 8;
+        let size = self.niblk() as usize / 8;
         unsafe {
             let ptr: *const u8 = &buf[offset];
             std::slice::from_raw_parts(ptr, size)
@@ -230,6 +230,17 @@ impl Cg {
     #define cg_clustersum(cgp) \
         ((int32_t *)((u_int8_t *)(cgp) + (cgp)->cg_clustersumoff))
     */
+}
+
+impl Cg {
+    fn niblk(&self) -> u32 {
+        // TODO: should use fs info
+        if self.cg_ffs2_niblk > 0 {
+            self.cg_ffs2_niblk
+        } else {
+            self.cg_niblk as u32
+        }
+    }
 }
 
 const DEV_BSHIFT: usize = 9;
@@ -711,17 +722,23 @@ fn main() -> Result<()> {
 
         let cg = fs.cg(&file, c as usize);
 
-        let inousedmap = cg.inosused(&file);
+        let inosusedmap = cg.inosused(&file);
         let blksfreemap = cg.blksfree(&file);
         info!("cg #{}: {:?}", c, cg,);
-        debug!("inoused={}/{:?}", inousedmap.len(), inousedmap,);
-        debug!("blkfree={}/{:?}", blksfreemap.len(), blksfreemap,);
 
         let inosused = if fs_v2 {
             cg.cg_initediblk.min(fs.fs_ipg)
         } else {
             fs.fs_ipg
         };
+
+        info!(
+            "inoused={}, {}/{:?}",
+            inosused,
+            inosusedmap.len(),
+            inosusedmap,
+        );
+        debug!("blkfree={}/{:?}", blksfreemap.len(), blksfreemap,);
 
         let ino_size = if fs_v2 {
             std::mem::size_of::<Ufs2Dinode>()
