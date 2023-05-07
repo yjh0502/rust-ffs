@@ -181,7 +181,16 @@ struct Cg {
 }
 
 impl Cg {
-    fn inosused(&self, cgoff: usize, buf: &[u8]) -> &[u8] {
+    fn cgoff(&self, buf: &[u8]) -> usize {
+        unsafe {
+            let ptr_cg: *const u8 = std::mem::transmute(self);
+            let ptr_buf: *const u8 = std::mem::transmute(buf.as_ptr());
+            ptr_cg.offset_from(ptr_buf) as usize
+        }
+    }
+
+    fn inosused(&self, buf: &[u8]) -> &[u8] {
+        let cgoff = self.cgoff(buf);
         let offset = cgoff + self.cg_iusedoff as usize;
         let size = self.cg_niblk as usize / 8;
         unsafe {
@@ -190,7 +199,8 @@ impl Cg {
         }
     }
 
-    fn blksfree(&self, cgoff: usize, buf: &[u8]) -> &[u8] {
+    fn blksfree(&self, buf: &[u8]) -> &[u8] {
+        let cgoff = self.cgoff(buf);
         let offset = cgoff + self.cg_freeoff as usize;
         let size = self.cg_ndblk as usize / 8;
         unsafe {
@@ -546,11 +556,20 @@ impl Fs {
             let remain = ino.di_size as usize - out.len();
             let read = remain.min(self.fs_bsize as usize);
             if read != self.fs_bsize as usize {
+                let c = self.dtog(blk as i32);
+                let bno = self.dtogd(blk as i32) as usize;
+                let cg = self.cg(buf, c as usize);
+
+                let blksfreemap = cg.blksfree(buf);
+                let bitmap = blksfreemap[bno >> 3];
+
                 println!(
-                    "read_indir: blk={}/{}/{}, fraglen={}/{}",
+                    "read_indir: c={}, blk={}/{}/{}, {:08b}, fraglen={}/{}",
+                    c,
                     blk,
                     self.blknum(blk as i32),
                     self.fragnum(blk as i32),
+                    bitmap,
                     read,
                     howmany(read, self.fs_fsize as usize)
                 );
@@ -689,8 +708,8 @@ fn main() -> Result<()> {
 
         let cg = fs.cg(&file, c as usize);
 
-        let inousedmap = cg.inosused(offset, &file);
-        let blksfreemap = cg.blksfree(offset, &file);
+        let inousedmap = cg.inosused(&file);
+        let blksfreemap = cg.blksfree(&file);
         eprintln!("cg #{}: {:?}", c, cg,);
         eprintln!("inoused={}/{:?}", inousedmap.len(), inousedmap,);
         eprintln!("blkfree={}/{:?}", blksfreemap.len(), blksfreemap,);
