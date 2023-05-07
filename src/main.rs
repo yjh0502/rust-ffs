@@ -478,24 +478,59 @@ impl Fs {
         &buf[offset..offset + len]
     }
 
-    fn read(&self, buf: &[u8], ino: &Ufs2Dinode) -> Vec<u8> {
-        assert_eq!(ino.di_ib, [0, 0, 0]);
+    fn read_indir(&self, buf: &[u8], ino: &Ufs2Dinode, blk: i64, depth: usize, out: &mut Vec<u8>) {
+        if blk == 0 {
+            return;
+        }
 
+        if depth == 0 {
+            let remain = ino.di_size as usize - out.len();
+            let read = remain.min(self.fs_bsize as usize);
+            out.extend_from_slice(self.blk(buf, blk as i32, read));
+            return;
+        }
+
+        let indir = self.blk(buf, blk as i32, self.fs_bsize as usize);
+        let blks: &[i32] = unsafe {
+            let ptr: *const i32 = std::mem::transmute(indir.as_ptr());
+            let size: usize = indir.len() / std::mem::size_of::<i32>();
+            std::slice::from_raw_parts(ptr, size)
+        };
+
+        for blk_child in blks {
+            let blk_child = *blk_child as i64;
+            if blk_child == 0 {
+                break;
+            }
+            self.read_indir(buf, ino, blk_child, depth - 1, out);
+        }
+    }
+
+    fn read(&self, buf: &[u8], ino: &Ufs2Dinode) -> Vec<u8> {
         let mut out = Vec::with_capacity(ino.di_size as usize);
 
         for i in 0..NDADDR {
             let blk = ino.di_db[i];
-            if blk == 0 {
-                break;
-            }
-            let remain = ino.di_size as usize - out.len();
-            let read = remain.min(self.fs_bsize as usize);
-            out.extend_from_slice(self.blk(buf, blk as i32, read));
-
+            self.read_indir(buf, ino, blk, 0, &mut out);
             if out.len() == ino.di_size as usize {
                 break;
             }
         }
+
+        for i in 0..NIADDR {
+            let blk = ino.di_ib[i];
+            self.read_indir(buf, ino, blk, i + 1, &mut out);
+            if out.len() == ino.di_size as usize {
+                break;
+            }
+        }
+
+        assert!(
+            out.len() == ino.di_size as usize,
+            "{}/{}",
+            out.len(),
+            ino.di_size
+        );
 
         out
     }
@@ -514,16 +549,13 @@ struct Bufarea {
     b_dirty: usize,
 }
 
-fn main() -> Result<()> {
-    let filepath = std::env::args().nth(1).expect("usage: cmd <file>");
-    let file = std::fs::read(filepath)?;
-
+fn fs(buf: &[u8]) -> &Fs {
     for offset in SBLOCKSEARCH {
-        if offset + SBSIZE >= file.len() {
+        if offset + SBSIZE >= buf.len() {
             continue;
         }
 
-        let fs: &Fs = unsafe { std::mem::transmute(&file[offset]) };
+        let fs: &Fs = unsafe { std::mem::transmute(&buf[offset]) };
 
         if fs.fs_magic != FS_UFS1_MAGIC && fs.fs_magic != FS_UFS2_MAGIC {
             continue;
@@ -535,162 +567,184 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let fs_v2 = fs.fs_magic == FS_UFS2_MAGIC;
+        return fs;
+    }
+    todo!();
+}
 
-        eprintln!("sb={:?}", fs);
+fn main() -> Result<()> {
+    let filepath = std::env::args().nth(1).expect("usage: cmd <file>");
+    let file = std::fs::read(filepath)?;
 
-        // consistency check
-        assert!(fs.fs_ncg >= 1);
-        assert!(fs.fs_cpg >= 1);
+    let fs = fs(&file);
 
-        if fs.fs_magic == FS_UFS1_MAGIC {
-            if fs.fs_ncg as i32 * fs.fs_cpg < fs.fs_ncyl
-                || (fs.fs_ncg as i32 - 1) * fs.fs_cpg >= fs.fs_ncyl
-            {
-                todo!();
-            }
+    let fs_v2 = fs.fs_magic == FS_UFS2_MAGIC;
+
+    eprintln!("sb={:?}", fs);
+
+    // consistency check
+    assert!(fs.fs_ncg >= 1);
+    assert!(fs.fs_cpg >= 1);
+
+    if fs.fs_magic == FS_UFS1_MAGIC {
+        if fs.fs_ncg as i32 * fs.fs_cpg < fs.fs_ncyl
+            || (fs.fs_ncg as i32 - 1) * fs.fs_cpg >= fs.fs_ncyl
+        {
+            todo!();
         }
+    }
 
-        assert!((fs.fs_sbsize as usize) < SBSIZE);
-        assert!((fs.fs_bsize as usize).is_power_of_two());
-        assert!((fs.fs_bsize as usize) >= MINBSIZE);
-        assert!((fs.fs_bsize as usize) <= MAXBSIZE);
+    assert!((fs.fs_sbsize as usize) < SBSIZE);
+    assert!((fs.fs_bsize as usize).is_power_of_two());
+    assert!((fs.fs_bsize as usize) >= MINBSIZE);
+    assert!((fs.fs_bsize as usize) <= MAXBSIZE);
 
-        assert!((fs.fs_fsize as usize).is_power_of_two());
-        assert!(fs.fs_fsize <= fs.fs_bsize);
-        assert!(fs.fs_fsize >= fs.fs_bsize / MAXFRAG as i32);
+    assert!((fs.fs_fsize as usize).is_power_of_two());
+    assert!(fs.fs_fsize <= fs.fs_bsize);
+    assert!(fs.fs_fsize >= fs.fs_bsize / MAXFRAG as i32);
 
-        let blk_alt = fs.cgsblock(fs.fs_ncg as i32 - 1);
-        let offset_alt = fs.fsbtodb(blk_alt) as usize * DEV_BSIZE;
+    let blk_alt = fs.cgsblock(fs.fs_ncg as i32 - 1);
+    let offset_alt = fs.fsbtodb(blk_alt) as usize * DEV_BSIZE;
 
-        let fs_alt: &Fs = unsafe { std::mem::transmute(&file[offset_alt]) };
+    let fs_alt: &Fs = unsafe { std::mem::transmute(&file[offset_alt]) };
 
-        assert_eq!(fs, fs_alt);
+    if fs != fs_alt {
+        eprintln!("superblock mismatch");
+        // assert_eq!(fs, fs_alt);
+    }
 
-        // pass0
-        for c in 0..fs.fs_ncg {
-            let blk = fs.cgtod(c as i32);
-            let offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
+    // pass0
+    for c in 0..fs.fs_ncg {
+        let blk = fs.cgtod(c as i32);
+        let offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
 
-            let cg: &Cg = unsafe { std::mem::transmute(&file[offset]) };
-            assert_eq!(cg.cg_magic, CG_MAGIC);
-            eprintln!("cg #{}: {:?}", c, cg);
+        let cg: &Cg = unsafe { std::mem::transmute(&file[offset]) };
+        assert_eq!(cg.cg_magic, CG_MAGIC);
+        eprintln!("cg #{}: {:?}", c, cg);
 
-            let inosused = if fs_v2 {
-                cg.cg_initediblk.min(fs.fs_ipg)
+        let inosused = if fs_v2 {
+            cg.cg_initediblk.min(fs.fs_ipg)
+        } else {
+            fs.fs_ipg
+        };
+
+        let ino_size = if fs_v2 {
+            std::mem::size_of::<Ufs2Dinode>()
+        } else {
+            std::mem::size_of::<Ufs1Dinode>()
+        } as u32;
+
+        dbg!(inosused);
+
+        for inumber in 0..inosused {
+            // TODO
+            let blk = fs.ino_to_fsba(inumber as i32);
+            let blk_offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
+
+            // TODO
+            let offset = blk_offset + (fs.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
+
+            let ino = if fs_v2 {
+                let dinode: &Ufs2Dinode = unsafe { std::mem::transmute(&file[offset]) };
+                *dinode
             } else {
-                fs.fs_ipg
+                let dinode: &Ufs1Dinode = unsafe { std::mem::transmute(&file[offset]) };
+                (*dinode).into()
             };
 
-            let ino_size = if fs_v2 {
-                std::mem::size_of::<Ufs2Dinode>()
+            let mode = ino.di_mode as usize & IFMT;
+            if ino.di_mode == 0 {
+                let d = Ufs2Dinode::default();
+                assert_eq!(d.di_db, ino.di_db);
+                assert_eq!(d.di_ib, ino.di_ib);
+                assert_eq!(d.di_mode, 0);
+                assert_eq!(d.di_size, 0);
+                continue;
+            }
+
+            assert!(ino.di_size <= fs.fs_maxfilesize);
+
+            if mode == IFDIR {
+                assert!(ino.di_size <= MAXDIRSIZE as u64);
+            }
+
+            let lndb = (ino.di_size + fs.fs_bsize as u64 - 1) / fs.fs_bsize as u64;
+            assert!(lndb <= std::i32::MAX as u64);
+
+            let mut ndb = lndb;
+            if mode == IFBLK || mode == IFCHR {
+                ndb += 1;
+            }
+            if mode == IFLNK {
+                // TODO
+                continue;
+            }
+
+            // direct blocks
+            for j in ndb..NDADDR as u64 {
+                assert_eq!(ino.di_db[j as usize], 0);
+            }
+
+            // indirect blocks
+            {
+                let mut nib = 0;
+                let mut ndb = ndb - NDADDR as u64;
+                while ndb > 0 {
+                    ndb = ndb / fs.fs_nindir as u64;
+                    nib += 1;
+                }
+                for j in nib..NIADDR {
+                    assert_eq!(ino.di_ib[j as usize], 0);
+                }
+            }
+
+            if ino.di_nlink <= 0 {
+                eprintln!("zero-link inode: ino={}", inumber);
+            }
+
+            /*
+            eprintln!(
+                "ino={}, ctime={}, mode={:0o}, size={}/{}",
+                inumber, ino.di_ctime, mode, ino.di_size, lndb
+            );
+            */
+
+            let data = fs.read(&file, &ino);
+            if mode == IFREG {
+                if let Ok(s) = std::str::from_utf8(&data) {
+                    // eprintln!("content={}", s);
+                }
             } else {
-                std::mem::size_of::<Ufs1Dinode>()
-            } as u32;
-
-            dbg!(inosused);
-
-            for inumber in 0..inosused {
-                // TODO
-                let blk = fs.ino_to_fsba(inumber as i32);
-                let blk_offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
-
-                // TODO
-                let offset =
-                    blk_offset + (fs.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
-
-                let ino = if fs_v2 {
-                    let dinode: &Ufs2Dinode = unsafe { std::mem::transmute(&file[offset]) };
-                    *dinode
-                } else {
-                    let dinode: &Ufs1Dinode = unsafe { std::mem::transmute(&file[offset]) };
-                    (*dinode).into()
-                };
-
-                let mode = ino.di_mode as usize & IFMT;
-                if ino.di_mode == 0 {
-                    let d = Ufs2Dinode::default();
-                    assert_eq!(d.di_db, ino.di_db);
-                    assert_eq!(d.di_ib, ino.di_ib);
-                    assert_eq!(d.di_mode, 0);
-                    assert_eq!(d.di_size, 0);
-                    continue;
-                }
-
-                assert!(ino.di_size <= fs.fs_maxfilesize);
-
-                if mode == IFDIR {
-                    assert!(ino.di_size <= MAXDIRSIZE as u64);
-                }
-
-                let lndb = (ino.di_size + fs.fs_bsize as u64 - 1) / fs.fs_bsize as u64;
-                assert!(lndb <= std::i32::MAX as u64);
-
-                let mut ndb = lndb;
-                if mode == IFBLK || mode == IFCHR {
-                    ndb += 1;
-                }
-                if mode == IFLNK {
-                    // TODO
-                    continue;
-                }
-
-                // direct blocks
-                for j in ndb..NDADDR as u64 {
-                    assert_eq!(ino.di_db[j as usize], 0);
-                }
-
-                // indirect blocks
-                {
-                    let mut nib = 0;
-                    let mut ndb = ndb - NDADDR as u64;
-                    while ndb > 0 {
-                        ndb = ndb / fs.fs_nindir as u64;
-                        nib += 1;
-                    }
-                    for j in nib..NIADDR {
-                        assert_eq!(ino.di_ib[j as usize], 0);
-                    }
-                }
-
-                if ino.di_nlink <= 0 {
-                    eprintln!("zero-link inode: ino={}", inumber);
-                }
-
                 eprintln!(
-                    "ino={}, ctime={}, mode={:0o}, size={}/{}",
-                    inumber, ino.di_ctime, mode, ino.di_size, lndb
+                    "ino={}, nlink={}, ctime={}, mode={:0o}, size={}/{}/{}",
+                    inumber,
+                    ino.di_nlink,
+                    ino.di_ctime,
+                    mode,
+                    ino.di_size,
+                    data.len(),
+                    lndb
                 );
 
-                let data = fs.read(&file, &ino);
-                if mode == IFREG {
-                    if let Ok(s) = std::str::from_utf8(&data) {
-                        // eprintln!("content={}", s);
-                    }
-                } else {
-                    let mut offset = 0;
-                    while offset < ino.di_size as usize {
-                        assert!(
-                            offset + std::mem::size_of::<Direct>() <= data.len(),
-                            "{}/{}/{}",
-                            offset,
-                            ino.di_size,
-                            data.len()
-                        );
+                let dirblks = data.len() / DEV_BSIZE;
 
-                        let dp: &Direct = unsafe { std::mem::transmute(&data[offset]) };
+                for dirblk in 0..dirblks {
+                    let mut blkdata = &data[dirblk * DEV_BSIZE..(dirblk + 1) * DEV_BSIZE];
+
+                    while blkdata.len() >= directsiz(0) {
+                        let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
                         if dp.d_ino == 0 {
-                            break;
+                            // continue;
                         }
 
                         let sz = directsiz(dp.d_namlen);
                         let namebuf: &[u8] = unsafe {
                             let buf: *const u8 =
-                                std::mem::transmute(&data[offset + std::mem::size_of::<Direct>()]);
+                                std::mem::transmute(&blkdata[std::mem::size_of::<Direct>()]);
                             std::slice::from_raw_parts(buf, dp.d_namlen as usize)
                         };
 
-                        offset += sz;
+                        blkdata = &blkdata[sz..];
 
                         let filename = if let Ok(s) = std::str::from_utf8(&namebuf) {
                             s
@@ -708,8 +762,6 @@ fn main() -> Result<()> {
             }
         }
     }
-
-    println!("Hello, world!");
 
     Ok(())
 }
