@@ -39,6 +39,15 @@ fn directsiz(len: u8) -> usize {
     (std::mem::size_of::<Direct>() + (len + 1) + 3) & (!3)
 }
 
+const DT_UNKNOWN: u8 = 0;
+const DT_FIFO: u8 = 1;
+const DT_CHR: u8 = 2;
+const DT_DIR: u8 = 4;
+const DT_BLK: u8 = 6;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
+const DT_SOCK: u8 = 12;
+
 // inode.h
 
 const ROOTINO: usize = 2;
@@ -539,6 +548,37 @@ fn howmany(a: usize, b: usize) -> usize {
 
 // extra helpers
 impl Fs {
+    fn check0(&self) {
+        // consistency check
+        assert!(self.fs_ncg >= 1);
+        assert!(self.fs_cpg >= 1);
+
+        if self.fs_magic == FS_UFS1_MAGIC {
+            if self.fs_ncg as i32 * self.fs_cpg < self.fs_ncyl
+                || (self.fs_ncg as i32 - 1) * self.fs_cpg >= self.fs_ncyl
+            {
+                todo!();
+            }
+        }
+
+        assert!((self.fs_sbsize as usize) < SBSIZE);
+        assert!((self.fs_bsize as usize).is_power_of_two());
+        assert!((self.fs_bsize as usize) >= MINBSIZE);
+        assert!((self.fs_bsize as usize) <= MAXBSIZE);
+
+        assert!((self.fs_fsize as usize).is_power_of_two());
+        assert!(self.fs_fsize <= self.fs_bsize);
+        assert!(self.fs_fsize >= self.fs_bsize / MAXFRAG as i32);
+    }
+
+    fn fs_alt<'a>(&'a self, buf: &'a [u8]) -> &'a Self {
+        let blk_alt = self.cgsblock(self.fs_ncg as i32 - 1);
+        let offset_alt = self.fsbtodb(blk_alt) as usize * DEV_BSIZE;
+
+        let fs_alt: &Fs = unsafe { std::mem::transmute(&buf[offset_alt]) };
+        fs_alt
+    }
+
     fn cg<'a>(&'a self, buf: &'a [u8], c: usize) -> &'a Cg {
         assert!(c <= self.fs_ncg as usize);
 
@@ -634,6 +674,76 @@ impl Fs {
 
         out
     }
+
+    fn v2(&self) -> bool {
+        self.fs_magic == FS_UFS2_MAGIC
+    }
+
+    fn dinode(&self, buf: &[u8], inumber: usize) -> Ufs2Dinode {
+        // TODO
+        let blk = self.ino_to_fsba(inumber as i32);
+        let blk_offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
+
+        let ino_size = if self.v2() {
+            std::mem::size_of::<Ufs2Dinode>()
+        } else {
+            std::mem::size_of::<Ufs1Dinode>()
+        } as u32;
+
+        // TODO
+        let offset = blk_offset + (self.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
+
+        let ino = if self.v2() {
+            let dinode: &Ufs2Dinode = unsafe { std::mem::transmute(&buf[offset]) };
+            *dinode
+        } else {
+            let dinode: &Ufs1Dinode = unsafe { std::mem::transmute(&buf[offset]) };
+            (*dinode).into()
+        };
+        ino
+    }
+
+    fn readdir<'a>(&'a self, buf: &'a [u8], inumber: usize) -> Vec<(&'a Direct, &'a str)> {
+        let ino = self.dinode(buf, inumber);
+        let data = self.read(buf, &ino);
+        let mut out = Vec::new();
+
+        let mode = ino.di_mode as usize & IFMT;
+        if mode & IFDIR == 0 {
+            return out;
+        }
+
+        let dirblks = data.len() / DEV_BSIZE;
+
+        for dirblk in 0..dirblks {
+            let mut blkdata = &data[dirblk * DEV_BSIZE..(dirblk + 1) * DEV_BSIZE];
+
+            while blkdata.len() >= directsiz(0) {
+                let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
+                if dp.d_ino == 0 {
+                    break;
+                }
+
+                let sz = directsiz(dp.d_namlen);
+                let namebuf: &[u8] = unsafe {
+                    let buf: *const u8 =
+                        std::mem::transmute(&blkdata[std::mem::size_of::<Direct>()]);
+                    std::slice::from_raw_parts(buf, dp.d_namlen as usize)
+                };
+
+                blkdata = &blkdata[sz..];
+
+                let filename = if let Ok(s) = std::str::from_utf8(&namebuf) {
+                    s
+                } else {
+                    "???"
+                };
+
+                out.push((dp, filename));
+            }
+        }
+        out
+    }
 }
 
 #[repr(C)]
@@ -672,44 +782,16 @@ fn fs(buf: &[u8]) -> &Fs {
     todo!();
 }
 
-fn main() -> Result<()> {
-    env_logger::init();
-
-    let filepath = std::env::args().nth(1).expect("usage: cmd <file>");
-    let file = std::fs::read(filepath)?;
-
-    let fs = fs(&file);
+fn fsck(buf: &[u8]) {
+    let fs = fs(buf);
 
     let fs_v2 = fs.fs_magic == FS_UFS2_MAGIC;
 
     info!("sb={:?}", fs);
 
-    // consistency check
-    assert!(fs.fs_ncg >= 1);
-    assert!(fs.fs_cpg >= 1);
+    fs.check0();
 
-    if fs.fs_magic == FS_UFS1_MAGIC {
-        if fs.fs_ncg as i32 * fs.fs_cpg < fs.fs_ncyl
-            || (fs.fs_ncg as i32 - 1) * fs.fs_cpg >= fs.fs_ncyl
-        {
-            todo!();
-        }
-    }
-
-    assert!((fs.fs_sbsize as usize) < SBSIZE);
-    assert!((fs.fs_bsize as usize).is_power_of_two());
-    assert!((fs.fs_bsize as usize) >= MINBSIZE);
-    assert!((fs.fs_bsize as usize) <= MAXBSIZE);
-
-    assert!((fs.fs_fsize as usize).is_power_of_two());
-    assert!(fs.fs_fsize <= fs.fs_bsize);
-    assert!(fs.fs_fsize >= fs.fs_bsize / MAXFRAG as i32);
-
-    let blk_alt = fs.cgsblock(fs.fs_ncg as i32 - 1);
-    let offset_alt = fs.fsbtodb(blk_alt) as usize * DEV_BSIZE;
-
-    let fs_alt: &Fs = unsafe { std::mem::transmute(&file[offset_alt]) };
-
+    let fs_alt = fs.fs_alt(&buf);
     if fs != fs_alt {
         error!("superblock mismatch");
         // assert_eq!(fs, fs_alt);
@@ -717,13 +799,10 @@ fn main() -> Result<()> {
 
     // pass0
     for c in 0..fs.fs_ncg {
-        let blk = fs.cgtod(c as i32);
-        let offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
+        let cg = fs.cg(buf, c as usize);
 
-        let cg = fs.cg(&file, c as usize);
-
-        let inosusedmap = cg.inosused(&file);
-        let blksfreemap = cg.blksfree(&file);
+        let inosusedmap = cg.inosused(buf);
+        let blksfreemap = cg.blksfree(buf);
         info!("cg #{}: {:?}", c, cg,);
 
         let inosused = if fs_v2 {
@@ -740,30 +819,11 @@ fn main() -> Result<()> {
         );
         debug!("blkfree={}/{:?}", blksfreemap.len(), blksfreemap,);
 
-        let ino_size = if fs_v2 {
-            std::mem::size_of::<Ufs2Dinode>()
-        } else {
-            std::mem::size_of::<Ufs1Dinode>()
-        } as u32;
-
         let ino_start = fs.fs_ipg * c;
         let ino_end = ino_start + inosused;
 
         for inumber in ino_start..ino_end {
-            // TODO
-            let blk = fs.ino_to_fsba(inumber as i32);
-            let blk_offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
-
-            // TODO
-            let offset = blk_offset + (fs.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
-
-            let ino = if fs_v2 {
-                let dinode: &Ufs2Dinode = unsafe { std::mem::transmute(&file[offset]) };
-                *dinode
-            } else {
-                let dinode: &Ufs1Dinode = unsafe { std::mem::transmute(&file[offset]) };
-                (*dinode).into()
-            };
+            let ino = fs.dinode(buf, inumber as usize);
 
             let mode = ino.di_mode as usize & IFMT;
             if ino.di_mode == 0 {
@@ -815,7 +875,7 @@ fn main() -> Result<()> {
                 error!("zero-link inode: ino={}", inumber);
             }
 
-            let data = fs.read(&file, &ino);
+            let data = fs.read(buf, &ino);
 
             debug!(
                 "ino={}, nlink={}, ctime={}, mode={:0o}, size={}/{}/{}",
@@ -869,6 +929,168 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+use fuser::*;
+
+use libc::ENOENT;
+use std::ffi::OsStr;
+use std::time::{Duration, UNIX_EPOCH};
+
+const TTL: Duration = Duration::from_secs(1); // 1 second
+
+struct FFS<'a> {
+    buf: &'a [u8],
+    fs: &'a Fs,
+}
+
+fn dinode_attr(ino: u64, dinode: &Ufs2Dinode) -> FileAttr {
+    let kind = if dinode.di_mode & IFDIR as u16 > 0 {
+        FileType::Directory
+    } else {
+        FileType::RegularFile
+    };
+
+    FileAttr {
+        ino,
+        size: dinode.di_size as u64,
+        blocks: 0,
+        atime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_atime as u64),
+        mtime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_mtime as u64),
+        ctime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_ctime as u64),
+        crtime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_birthtime as u64),
+        kind,
+        perm: dinode.di_mode,
+        nlink: dinode.di_nlink as u32,
+        uid: dinode.di_uid,
+        gid: dinode.di_gid,
+        rdev: 0,
+        flags: 0,
+        blksize: 512,
+    }
+}
+
+impl<'a> Filesystem for FFS<'a> {
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        info!("lookup: parent={}, name={:?}", parent, name);
+
+        let inumber = parent + 1;
+        for (direct, direct_name) in self.fs.readdir(self.buf, inumber as usize) {
+            if direct_name != name {
+                continue;
+            }
+
+            let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
+
+            let kind = if dinode.di_mode & IFDIR as u16 > 0 {
+                FileType::Directory
+            } else if dinode.di_mode & IFREG as u16 > 0 {
+                FileType::RegularFile
+            } else {
+                continue;
+            };
+
+            let inumber = direct.d_ino as u64 - 1;
+            reply.entry(&TTL, &dinode_attr(inumber, &dinode), inumber);
+            return;
+        }
+
+        reply.error(ENOENT);
+    }
+
+    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        info!("getattr: ino={}", ino);
+
+        let dinode = self.fs.dinode(self.buf, (ino + 1) as usize);
+        eprintln!("dinode={:?}", dinode);
+
+        let kind = if dinode.di_mode & IFDIR as u16 > 0 {
+            FileType::Directory
+        } else if dinode.di_mode & IFREG as u16 > 0 {
+            FileType::RegularFile
+        } else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        reply.attr(&TTL, &dinode_attr(ino, &dinode));
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: ReplyData,
+    ) {
+        let inumber = (ino + 1) as usize;
+        let dinode = self.fs.dinode(self.buf, inumber);
+        if dinode.di_mode == 0 {
+            reply.error(ENOENT);
+            return;
+        }
+
+        let data = self.fs.read(self.buf, &dinode);
+        let size = std::cmp::min(size as usize, data.len() - offset as usize);
+        reply.data(&data[offset as usize..(offset as usize + size)]);
+    }
+
+    fn readdir(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        info!("readdir: ino={}, offset={}", ino, offset);
+
+        let inumber = ino + 1;
+
+        let directs = self.fs.readdir(self.buf, inumber as usize);
+
+        for (i, (direct, name)) in directs.into_iter().enumerate() {
+            if i <= offset as usize {
+                continue;
+            }
+
+            let kind = if direct.d_type & DT_DIR > 0 {
+                FileType::Directory
+            } else if direct.d_type & DT_REG > 0 {
+                FileType::RegularFile
+            } else {
+                continue;
+            };
+
+            if reply.add((direct.d_ino - 1) as u64, (i + 1) as i64, kind, name) {
+                break;
+            }
+        }
+
+        reply.ok();
+    }
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+
+    let filepath = std::env::args().nth(1).expect("usage: cmd <file>");
+    let file = std::fs::read(filepath)?;
+
+    fsck(&file);
+
+    let mut options = vec![MountOption::RO, MountOption::FSName("ffs".to_string())];
+    options.push(MountOption::AutoUnmount);
+    options.push(MountOption::AllowRoot);
+
+    let buf = file.as_slice();
+    let fs = fs(buf);
+    let ffs = FFS { buf, fs: &fs };
+    fuser::mount2(ffs, "mnt", &options).unwrap();
 
     Ok(())
 }
