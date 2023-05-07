@@ -635,8 +635,10 @@ fn main() -> Result<()> {
         } as u32;
 
         dbg!(inosused);
+        let ino_start = fs.fs_ipg * c;
+        let ino_end = ino_start + inosused;
 
-        for inumber in 0..inosused {
+        for inumber in ino_start..ino_end {
             // TODO
             let blk = fs.ino_to_fsba(inumber as i32);
             let blk_offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
@@ -702,30 +704,24 @@ fn main() -> Result<()> {
                 eprintln!("zero-link inode: ino={}", inumber);
             }
 
-            /*
-            eprintln!(
-                "ino={}, ctime={}, mode={:0o}, size={}/{}",
-                inumber, ino.di_ctime, mode, ino.di_size, lndb
-            );
-            */
-
             let data = fs.read(&file, &ino);
+
+            eprintln!(
+                "ino={}, nlink={}, ctime={}, mode={:0o}, size={}/{}/{}",
+                inumber,
+                ino.di_nlink,
+                ino.di_ctime,
+                mode,
+                ino.di_size,
+                data.len(),
+                lndb
+            );
+
             if mode == IFREG {
                 if let Ok(s) = std::str::from_utf8(&data) {
                     // eprintln!("content={}", s);
                 }
             } else {
-                eprintln!(
-                    "ino={}, nlink={}, ctime={}, mode={:0o}, size={}/{}/{}",
-                    inumber,
-                    ino.di_nlink,
-                    ino.di_ctime,
-                    mode,
-                    ino.di_size,
-                    data.len(),
-                    lndb
-                );
-
                 let dirblks = data.len() / DEV_BSIZE;
 
                 for dirblk in 0..dirblks {
@@ -734,7 +730,7 @@ fn main() -> Result<()> {
                     while blkdata.len() >= directsiz(0) {
                         let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
                         if dp.d_ino == 0 {
-                            // continue;
+                            break;
                         }
 
                         let sz = directsiz(dp.d_namlen);
