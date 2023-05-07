@@ -162,20 +162,22 @@ struct Cg {
     cg_frotor: u32,           /* position of last used frag */
     cg_irotor: u32,           /* position of last used inode */
     cg_frsum: [u32; MAXFRAG], /* counts of available frags */
-    cg_btotoff: i32,          /* (int32) block totals per cylinder */
-    cg_boff: i32,             /* (u_int16) free block positions */
-    cg_iusedoff: u32,         /* (u_int8) used inode map */
-    cg_freeoff: u32,          /* (u_int8) free block map */
-    cg_nextfreeoff: u32,      /* (u_int8) next available space */
-    cg_clustersumoff: u32,    /* (u_int32) counts of avail clusters */
-    cg_clusteroff: u32,       /* (u_int8) free cluster map */
-    cg_nclusterblks: u32,     /* number of clusters this cg */
-    cg_ffs2_niblk: u32,       /* number of inode blocks this cg */
-    cg_initediblk: u32,       /* last initialized inode */
-    cg_sparecon32: [i32; 3],  /* reserved for future use */
-    cg_ffs2_time: i64,        /* time last written */
-    cg_sparecon64: [i64; 3],  /* reserved for future use */
-                              /* actually longer */
+    // FFS1 only
+    cg_btotoff: i32, /* (int32) block totals per cylinder */
+    // FFS1 only
+    cg_boff: i32,            /* (u_int16) free block positions */
+    cg_iusedoff: u32,        /* (u_int8) used inode map */
+    cg_freeoff: u32,         /* (u_int8) free block map */
+    cg_nextfreeoff: u32,     /* (u_int8) next available space */
+    cg_clustersumoff: u32,   /* (u_int32) counts of avail clusters */
+    cg_clusteroff: u32,      /* (u_int8) free cluster map */
+    cg_nclusterblks: u32,    /* number of clusters this cg */
+    cg_ffs2_niblk: u32,      /* number of inode blocks this cg */
+    cg_initediblk: u32,      /* last initialized inode */
+    cg_sparecon32: [i32; 3], /* reserved for future use */
+    cg_ffs2_time: i64,       /* time last written */
+    cg_sparecon64: [i64; 3], /* reserved for future use */
+                             /* actually longer */
 }
 
 impl Cg {
@@ -501,16 +503,32 @@ impl Fs {
     fn blkstofrags(&self, blks: i32) -> i32 {
         blks << self.fs_fragshift
     }
-    /*
-    #define fragnum(fs, fsb)	/* calculates (fsb % fs->fs_frag) */ \
-        ((fsb) & ((fs)->fs_frag - 1))
-    #define blknum(fs, fsb)		/* calculates rounddown(fsb, fs->fs_frag) */ \
-        ((fsb) &~ ((fs)->fs_frag - 1))
-        */
+    fn fragnum(&self, fsb: i32) -> i32 {
+        fsb & (self.fs_frag - 1)
+    }
+    fn blknum(&self, fsb: i32) -> i32 {
+        fsb & !(self.fs_frag - 1)
+    }
+}
+
+fn howmany(a: usize, b: usize) -> usize {
+    (a + b - 1) / b
 }
 
 // extra helpers
 impl Fs {
+    fn cg<'a>(&'a self, buf: &'a [u8], c: usize) -> &'a Cg {
+        assert!(c <= self.fs_ncg as usize);
+
+        let blk = self.cgtod(c as i32);
+        let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
+
+        let cg: &'a Cg = unsafe { std::mem::transmute(&buf[offset]) };
+        assert_eq!(cg.cg_magic, CG_MAGIC);
+
+        cg
+    }
+
     fn blk<'a, 'b>(&'a self, buf: &'b [u8], blk: i32, len: usize) -> &'b [u8] {
         assert!(len <= self.fs_bsize as usize, "{}", len);
         let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
@@ -527,6 +545,16 @@ impl Fs {
         if depth == 0 {
             let remain = ino.di_size as usize - out.len();
             let read = remain.min(self.fs_bsize as usize);
+            if read != self.fs_bsize as usize {
+                println!(
+                    "read_indir: blk={}/{}/{}, fraglen={}/{}",
+                    blk,
+                    self.blknum(blk as i32),
+                    self.fragnum(blk as i32),
+                    read,
+                    howmany(read, self.fs_fsize as usize)
+                );
+            }
             out.extend_from_slice(self.blk(buf, blk as i32, read));
             return;
         }
@@ -659,8 +687,7 @@ fn main() -> Result<()> {
         let blk = fs.cgtod(c as i32);
         let offset = fs.fsbtodb(blk) as usize * DEV_BSIZE;
 
-        let cg: &Cg = unsafe { std::mem::transmute(&file[offset]) };
-        assert_eq!(cg.cg_magic, CG_MAGIC);
+        let cg = fs.cg(&file, c as usize);
 
         let inousedmap = cg.inosused(offset, &file);
         let blksfreemap = cg.blksfree(offset, &file);
