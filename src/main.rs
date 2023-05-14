@@ -546,6 +546,13 @@ fn howmany(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
+enum BlkPos {
+    Direct(u16),
+    Indirect1(u16),
+    Indirect2(u16, u16),
+    Indirect3(u16, u16, u16),
+}
+
 // extra helpers
 impl Fs {
     fn check0(&self) {
@@ -569,6 +576,11 @@ impl Fs {
         assert!((self.fs_fsize as usize).is_power_of_two());
         assert!(self.fs_fsize <= self.fs_bsize);
         assert!(self.fs_fsize >= self.fs_bsize / MAXFRAG as i32);
+
+        assert_eq!(
+            self.fs_nindir,
+            self.fs_bsize / std::mem::size_of::<i32>() as i32
+        );
     }
 
     fn fs_alt<'a>(&'a self, buf: &'a [u8]) -> &'a Self {
@@ -591,12 +603,26 @@ impl Fs {
         cg
     }
 
+    fn blk0<'a, 'b>(&'a self, buf: &'b [u8], blk: i32) -> &'b [u8] {
+        let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
+        assert!(offset + self.fs_bsize as usize <= buf.len());
+        &buf[offset..offset + self.fs_bsize as usize]
+    }
+
     fn blk<'a, 'b>(&'a self, buf: &'b [u8], blk: i32, len: usize) -> &'b [u8] {
         assert!(len <= self.fs_bsize as usize, "{}", len);
         let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
         assert!(offset + len <= buf.len());
 
         &buf[offset..offset + len]
+    }
+
+    fn blk_indir<'a>(&'a self, buf: &'a [u8], blk: i32) -> &'a [i32] {
+        let indir = self.blk0(buf, blk as i32);
+        unsafe {
+            let ptr: *const i32 = std::mem::transmute(indir.as_ptr());
+            std::slice::from_raw_parts(ptr, self.fs_nindir as usize)
+        }
     }
 
     fn read_indir(&self, buf: &[u8], ino: &Ufs2Dinode, blk: i64, depth: usize, out: &mut Vec<u8>) {
@@ -630,19 +656,71 @@ impl Fs {
             return;
         }
 
-        let indir = self.blk(buf, blk as i32, self.fs_bsize as usize);
-        let blks: &[i32] = unsafe {
-            let ptr: *const i32 = std::mem::transmute(indir.as_ptr());
-            let size: usize = indir.len() / std::mem::size_of::<i32>();
-            std::slice::from_raw_parts(ptr, size)
-        };
-
+        let blks: &[i32] = self.blk_indir(buf, blk as i32);
         for blk_child in blks {
             let blk_child = *blk_child as i64;
             if blk_child == 0 {
                 break;
             }
             self.read_indir(buf, ino, blk_child, depth - 1, out);
+        }
+    }
+
+    fn blkpos<'a>(&'a self, ino: &'a Ufs2Dinode, blkno: usize) -> BlkPos {
+        if blkno < NDADDR {
+            return BlkPos::Direct(blkno as u16);
+        }
+
+        let ref_per_blk = self.fs_nindir as usize;
+
+        let mut blkno = blkno - NDADDR;
+        if blkno < ref_per_blk {
+            return BlkPos::Indirect1(blkno as u16);
+        }
+
+        let ref_per_blk2 = ref_per_blk * ref_per_blk;
+
+        blkno -= ref_per_blk;
+        if blkno < ref_per_blk2 {
+            let b0 = blkno / ref_per_blk;
+            let b1 = blkno - b0 * ref_per_blk;
+            return BlkPos::Indirect2(b0 as u16, b1 as u16);
+        }
+        blkno -= ref_per_blk2;
+
+        let ref_per_blk3 = ref_per_blk2 * ref_per_blk;
+        if blkno < ref_per_blk3 {
+            let b0 = blkno / ref_per_blk2;
+            blkno -= b0 * ref_per_blk2;
+            let b1 = blkno / ref_per_blk;
+            let b2 = blkno - b0 * ref_per_blk;
+            return BlkPos::Indirect3(b0 as u16, b1 as u16, b2 as u16);
+        } else {
+            todo!();
+        }
+    }
+
+    fn readat<'a, 'b>(&'a self, buf: &'a [u8], ino: &'b Ufs2Dinode, blkno: usize) -> &'a [u8] {
+        match self.blkpos(ino, blkno) {
+            BlkPos::Direct(blkno) => {
+                let blk = ino.di_db[blkno as usize];
+                self.blk0(buf, blk as i32)
+            }
+            BlkPos::Indirect1(b0) => {
+                let indir0 = self.blk_indir(buf, ino.di_ib[0] as i32);
+                self.blk0(buf, indir0[b0 as usize] as i32)
+            }
+            BlkPos::Indirect2(b0, b1) => {
+                let indir0 = self.blk_indir(buf, ino.di_ib[1] as i32);
+                let indir1 = self.blk_indir(buf, indir0[b0 as usize]);
+                self.blk0(buf, indir1[b1 as usize] as i32)
+            }
+            BlkPos::Indirect3(b0, b1, b2) => {
+                let indir0 = self.blk_indir(buf, ino.di_ib[2] as i32);
+                let indir1 = self.blk_indir(buf, indir0[b0 as usize]);
+                let indir2 = self.blk_indir(buf, indir1[b1 as usize]);
+                self.blk0(buf, indir2[b2 as usize] as i32)
+            }
         }
     }
 
@@ -703,45 +781,51 @@ impl Fs {
         ino
     }
 
+    fn parsedirblk<'a>(&'a self, blk: &'a [u8]) -> Vec<(&'a Direct, &'a str)> {
+        let mut out = Vec::new();
+
+        let mut blkdata = blk;
+        while blkdata.len() >= directsiz(0) {
+            let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
+            if dp.d_ino == 0 {
+                break;
+            }
+
+            let sz = directsiz(dp.d_namlen);
+            let namebuf: &[u8] = unsafe {
+                let buf: *const u8 = std::mem::transmute(&blkdata[std::mem::size_of::<Direct>()]);
+                std::slice::from_raw_parts(buf, dp.d_namlen as usize)
+            };
+
+            blkdata = &blkdata[sz..];
+
+            let filename = if let Ok(s) = std::str::from_utf8(&namebuf) {
+                s
+            } else {
+                "???"
+            };
+
+            out.push((dp, filename));
+        }
+        out
+    }
+
     fn readdir<'a>(&'a self, buf: &'a [u8], inumber: usize) -> Vec<(&'a Direct, &'a str)> {
         let ino = self.dinode(buf, inumber);
-        let data = self.read(buf, &ino);
-        let mut out = Vec::new();
 
         let mode = ino.di_mode as usize & IFMT;
         if mode & IFDIR == 0 {
-            return out;
+            return vec![];
         }
 
-        let dirblks = data.len() / DEV_BSIZE;
-
-        for dirblk in 0..dirblks {
-            let mut blkdata = &data[dirblk * DEV_BSIZE..(dirblk + 1) * DEV_BSIZE];
-
-            while blkdata.len() >= directsiz(0) {
-                let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
-                if dp.d_ino == 0 {
-                    break;
-                }
-
-                let sz = directsiz(dp.d_namlen);
-                let namebuf: &[u8] = unsafe {
-                    let buf: *const u8 =
-                        std::mem::transmute(&blkdata[std::mem::size_of::<Direct>()]);
-                    std::slice::from_raw_parts(buf, dp.d_namlen as usize)
-                };
-
-                blkdata = &blkdata[sz..];
-
-                let filename = if let Ok(s) = std::str::from_utf8(&namebuf) {
-                    s
-                } else {
-                    "???"
-                };
-
-                out.push((dp, filename));
-            }
+        let mut out = Vec::new();
+        let nblk = ino.di_size as usize / DEV_BSIZE;
+        for blkno in 0..nblk {
+            let buf = self.readat(buf, &ino, blkno);
+            let dirs = self.parsedirblk(&buf);
+            out.extend(dirs);
         }
+
         out
     }
 }
@@ -945,10 +1029,12 @@ struct FFS<'a> {
 }
 
 fn dinode_attr(ino: u64, dinode: &Ufs2Dinode) -> FileAttr {
-    let kind = if dinode.di_mode & IFDIR as u16 > 0 {
+    let kind = if dinode.di_mode & IFDIR as u16 != 0 {
         FileType::Directory
-    } else {
+    } else if dinode.di_mode & IFREG as u16 != 0 {
         FileType::RegularFile
+    } else {
+        todo!("unknown file type");
     };
 
     FileAttr {
@@ -1003,15 +1089,6 @@ impl<'a> Filesystem for FFS<'a> {
 
         let dinode = self.fs.dinode(self.buf, (ino + 1) as usize);
         eprintln!("dinode={:?}", dinode);
-
-        let kind = if dinode.di_mode & IFDIR as u16 > 0 {
-            FileType::Directory
-        } else if dinode.di_mode & IFREG as u16 > 0 {
-            FileType::RegularFile
-        } else {
-            reply.error(ENOENT);
-            return;
-        };
 
         reply.attr(&TTL, &dinode_attr(ino, &dinode));
     }
@@ -1083,9 +1160,12 @@ fn main() -> Result<()> {
 
     fsck(&file);
 
-    let mut options = vec![MountOption::RO, MountOption::FSName("ffs".to_string())];
-    options.push(MountOption::AutoUnmount);
-    options.push(MountOption::AllowRoot);
+    let options = vec![
+        MountOption::RW,
+        MountOption::AutoUnmount,
+        MountOption::AllowRoot,
+        MountOption::FSName("ffs".to_string()),
+    ];
 
     let buf = file.as_slice();
     let fs = fs(buf);
