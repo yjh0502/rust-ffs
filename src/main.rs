@@ -882,48 +882,70 @@ impl Fs {
         self.fs_magic == FS_UFS2_MAGIC
     }
 
-    fn dinode_write<'a, 'b>(&self, buf: &mut [u8], inumber: usize, inode: &Ufs2Dinode) {
-        let blk = self.ino_to_fsba(inumber as i32);
-        let blk_offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
+    fn dinode<'a, 'b>(&self, buf: &[u8], inumber: usize) -> Ufs2Dinode {
+        let blkno = self.ino_to_fsba(inumber as i32);
+        let blkbuf = self.blk0(buf, blkno);
 
-        let ino_size = if self.v2() {
-            std::mem::size_of::<Ufs2Dinode>()
-        } else {
-            std::mem::size_of::<Ufs1Dinode>()
-        } as u32;
-
-        let offset = blk_offset + (self.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
+        let ino_size = self.fs_bsize as u32 / self.fs_inopb;
+        let offset = (self.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
 
         if self.v2() {
-            let dinode: &mut Ufs2Dinode = unsafe { std::mem::transmute(&mut buf[offset]) };
-            *dinode = *inode;
-        } else {
-            let dinode: &mut Ufs1Dinode = unsafe { std::mem::transmute(&mut buf[offset]) };
-            *dinode = Ufs1Dinode::from(*inode);
-        };
-    }
-
-    fn dinode(&self, buf: &[u8], inumber: usize) -> Ufs2Dinode {
-        let blk = self.ino_to_fsba(inumber as i32);
-        let blk_offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
-
-        let ino_size = if self.v2() {
-            std::mem::size_of::<Ufs2Dinode>()
-        } else {
-            std::mem::size_of::<Ufs1Dinode>()
-        } as u32;
-
-        // TODO
-        let offset = blk_offset + (self.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
-
-        let ino = if self.v2() {
-            let dinode: &Ufs2Dinode = unsafe { std::mem::transmute(&buf[offset]) };
+            let dinode: &Ufs2Dinode = unsafe { std::mem::transmute(&blkbuf[offset]) };
             *dinode
         } else {
-            let dinode: &Ufs1Dinode = unsafe { std::mem::transmute(&buf[offset]) };
-            (*dinode).into()
-        };
-        ino
+            let dinode1: &Ufs1Dinode = unsafe { std::mem::transmute(&blkbuf[offset]) };
+            Ufs2Dinode::from(*dinode1)
+        }
+    }
+
+    fn dinode_mut<'a, 'b, F, R>(&self, buf: &mut [u8], inumber: usize, f: F) -> R
+    where
+        F: FnOnce(&mut Ufs2Dinode) -> R,
+    {
+        let blkno = self.ino_to_fsba(inumber as i32);
+        let blkbuf = self.blk0_mut(buf, blkno);
+
+        let ino_size = self.fs_bsize as u32 / self.fs_inopb;
+        let offset = (self.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
+
+        if self.v2() {
+            let dinode: &mut Ufs2Dinode = unsafe { std::mem::transmute(&mut blkbuf[offset]) };
+            f(dinode)
+        } else {
+            let dinode1: &mut Ufs1Dinode = unsafe { std::mem::transmute(&mut blkbuf[offset]) };
+            let mut dinode = Ufs2Dinode::from(*dinode1);
+            let ret = f(&mut dinode);
+            *dinode1 = Ufs1Dinode::from(dinode);
+            ret
+        }
+    }
+
+    fn dinode_free<'a, 'b>(&self, buf: &mut [u8], inumber: usize) {
+        self.dinode_mut(buf, inumber, |inode| {
+            *inode = Ufs2Dinode::default();
+        });
+
+        let c = self.ino_to_cg(inumber as i32) as usize;
+        let map = self.cg_inosused_mut(buf, c);
+
+        assert!(isset(map, inumber));
+        clrbit(map, inumber);
+    }
+
+    fn dinode_alloc<'a, 'b>(&self, buf: &mut [u8], inumber: usize, inode: &Ufs2Dinode) {
+        let c = self.ino_to_cg(inumber as i32) as usize;
+        let map = self.cg_inosused_mut(buf, c);
+
+        assert!(!isset(map, inumber));
+        setbit(map, inumber);
+
+        self.dinode_update(buf, inumber, inode);
+    }
+
+    fn dinode_update<'a, 'b>(&self, buf: &mut [u8], inumber: usize, inode: &Ufs2Dinode) {
+        self.dinode_mut(buf, inumber, |inode1| {
+            *inode1 = *inode;
+        })
     }
 
     fn dirparseblk<'a>(&'a self, blk: &'a [u8]) -> Vec<(&'a Direct, &'a str)> {
@@ -974,7 +996,7 @@ impl Fs {
         out
     }
 
-    fn dir_delete(&self, buf: &mut [u8], inumber_p: usize, name: &str) -> Option<usize> {
+    fn dir_delete(&self, buf: &mut [u8], inumber_p: usize, name: &str) -> Option<Direct> {
         let dinode_p = self.dinode(buf, inumber_p);
 
         let mode = dinode_p.di_mode as usize & IFMT;
@@ -982,7 +1004,7 @@ impl Fs {
             todo!();
         }
 
-        let mut inumber = None;
+        let mut ret = None;
         let mut blkbuf_out = Vec::with_capacity(self.fs_bsize as usize);
         blkbuf_out.resize(self.fs_bsize as usize, 0);
 
@@ -1002,7 +1024,7 @@ impl Fs {
             let mut found = false;
             for (direct, filename) in self.dirparseblk(&blkbuf) {
                 if filename == name {
-                    inumber = Some(direct.d_ino as usize);
+                    ret = Some(*direct);
                     found = true;
                     continue;
                 }
@@ -1014,7 +1036,7 @@ impl Fs {
             break;
         }
 
-        inumber
+        ret
     }
 
     fn dir_append(&self, buf: &mut [u8], inumber: usize, direct: Direct, name: &[u8]) {
@@ -1028,7 +1050,7 @@ impl Fs {
         direct_append(blk, direct, name);
     }
 
-    fn allocinode<'a, 'b>(&'a self, buf: &'b mut [u8], dinode: &Ufs2Dinode) -> usize {
+    fn inode_alloc<'a, 'b>(&'a self, buf: &'b mut [u8], dinode: &Ufs2Dinode) -> usize {
         let c = 0;
 
         let ino = {
@@ -1046,14 +1068,12 @@ impl Fs {
                 panic!("out of inodes");
             }
 
-            setbit(map, ino);
-
             //TODO: cg.cg_initediblk
 
             ino
         };
 
-        self.dinode_write(buf, ino, dinode);
+        self.dinode_alloc(buf, ino, dinode);
 
         ino
     }
@@ -1372,7 +1392,7 @@ impl<'a> Filesystem for FFS<'a> {
         };
 
         // allocate inod
-        let inumber = self.fs.allocinode(self.buf, &dinode);
+        let inumber = self.fs.inode_alloc(self.buf, &dinode);
 
         // update directory
         let name = name.to_str().unwrap();
@@ -1388,7 +1408,7 @@ impl<'a> Filesystem for FFS<'a> {
         // update parent inode
         {
             dinode_p.di_nlink += 1;
-            self.fs.dinode_write(self.buf, inumber_p, &dinode_p);
+            self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
         }
 
         let ino = (inumber - 1) as u64;
@@ -1402,7 +1422,7 @@ impl<'a> Filesystem for FFS<'a> {
 
         let name = name.to_str().unwrap();
         let inumber = match self.fs.dir_delete(self.buf, inumber_p, name) {
-            Some(ino) => ino,
+            Some(direct) => direct.d_ino as usize,
             None => {
                 reply.error(libc::ENOENT);
                 return;
@@ -1414,11 +1434,55 @@ impl<'a> Filesystem for FFS<'a> {
         dinode.di_nlink -= 1;
 
         if dinode.di_nlink == 0 {
-            dinode.di_mode = 0;
+            self.fs.dinode_free(self.buf, inumber);
+        } else {
+            self.fs.dinode_update(self.buf, inumber, &dinode);
         }
 
-        self.fs.dinode_write(self.buf, inumber, &dinode);
-        self.fs.dinode_write(self.buf, inumber_p, &dinode_p);
+        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
+
+        reply.ok();
+    }
+
+    /// Rename a file.
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let inumber_p = (parent + 1) as usize;
+        let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
+
+        let inumber_newp = (newparent + 1) as usize;
+        let mut dinode_newp = self.fs.dinode(self.buf, inumber_newp);
+
+        if dinode_p.di_mode == 0 || dinode_newp.di_mode == 0 {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        let name = name.to_str().unwrap();
+        let newname = newname.to_str().unwrap();
+
+        let mut direct = match self.fs.dir_delete(self.buf, inumber_p, name) {
+            Some(direct) => direct,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        direct.d_namlen = newname.len() as u8;
+        self.fs
+            .dir_append(self.buf, inumber_newp, direct, newname.as_bytes());
+
+        dinode_p.di_nlink -= 1;
+        dinode_newp.di_nlink += 1;
 
         reply.ok();
     }
@@ -1481,7 +1545,7 @@ impl<'a> Filesystem for FFS<'a> {
             dinode.di_flags = flags;
         }
 
-        self.fs.dinode_write(self.buf, inumber, &dinode);
+        self.fs.dinode_update(self.buf, inumber, &dinode);
 
         reply.attr(&TTL, &dinode_attr(ino, &dinode));
     }
