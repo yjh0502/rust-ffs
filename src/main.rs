@@ -190,35 +190,27 @@ struct Cg {
                              /* actually longer */
 }
 
+impl Fs {
+    fn cg_inosused(&self, buf: &[u8], c: usize) -> &[u8] {
+        let cgbuf = self.cgbuf(buf, c);
+        let cg: &Cg = unsafe { std::mem::transmute(&cgbuf[0]) };
+
+        let offset = cg.cg_iusedoff as usize;
+        let size = cg.niblk() as usize / 8;
+        unsafe { std::slice::from_raw_parts(&cgbuf[offset], size) }
+    }
+
+    fn cg_blksfree(&self, buf: &[u8], c: usize) -> &[u8] {
+        let cgbuf = self.cgbuf(buf, c);
+        let cg: &Cg = unsafe { std::mem::transmute(&cgbuf[0]) };
+
+        let offset = cg.cg_freeoff as usize;
+        let size = cg.cg_ndblk as usize / 8;
+        unsafe { std::slice::from_raw_parts(&buf[offset], size) }
+    }
+}
+
 impl Cg {
-    fn cgoff(&self, buf: &[u8]) -> usize {
-        unsafe {
-            let ptr_cg: *const u8 = std::mem::transmute(self);
-            let ptr_buf: *const u8 = std::mem::transmute(buf.as_ptr());
-            ptr_cg.offset_from(ptr_buf) as usize
-        }
-    }
-
-    fn inosused(&self, buf: &[u8]) -> &[u8] {
-        let cgoff = self.cgoff(buf);
-        let offset = cgoff + self.cg_iusedoff as usize;
-        let size = self.niblk() as usize / 8;
-        unsafe {
-            let ptr: *const u8 = &buf[offset];
-            std::slice::from_raw_parts(ptr, size)
-        }
-    }
-
-    fn blksfree(&self, buf: &[u8]) -> &[u8] {
-        let cgoff = self.cgoff(buf);
-        let offset = cgoff + self.cg_freeoff as usize;
-        let size = self.cg_ndblk as usize / 8;
-        unsafe {
-            let ptr: *const u8 = &buf[offset];
-            std::slice::from_raw_parts(ptr, size)
-        }
-    }
-
     /*
      * Macros for access to cylinder group array structures
      */
@@ -591,13 +583,18 @@ impl Fs {
         fs_alt.clone()
     }
 
-    fn cg(&self, buf: &[u8], c: usize) -> Cg {
+    fn cgbuf<'a, 'b>(&'a self, buf: &'b [u8], c: usize) -> &'b [u8] {
         assert!(c <= self.fs_ncg as usize);
 
         let blk = self.cgtod(c as i32);
         let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
 
-        let cg: &Cg = unsafe { std::mem::transmute(&buf[offset]) };
+        &buf[offset..(offset + self.fs_cgsize as usize)]
+    }
+
+    fn cg(&self, buf: &[u8], c: usize) -> Cg {
+        let cgbuf = self.cgbuf(buf, c);
+        let cg: &Cg = unsafe { std::mem::transmute(&cgbuf[0]) };
         assert_eq!(cg.cg_magic, CG_MAGIC);
 
         cg.clone()
@@ -638,7 +635,7 @@ impl Fs {
                 let bno = self.dtogd(blk as i32) as usize;
                 let cg = self.cg(buf, c as usize);
 
-                let blksfreemap = cg.blksfree(buf);
+                let blksfreemap = self.cg_blksfree(buf, c as usize);
                 let bitmap = blksfreemap[bno >> 3];
 
                 info!(
@@ -885,8 +882,8 @@ fn fsck(buf: &[u8]) {
     for c in 0..fs.fs_ncg {
         let cg = fs.cg(buf, c as usize);
 
-        let inosusedmap = cg.inosused(buf);
-        let blksfreemap = cg.blksfree(buf);
+        let inosusedmap = fs.cg_inosused(buf, c as usize);
+        let blksfreemap = fs.cg_blksfree(buf, c as usize);
         info!("cg #{}: {:?}", c, cg,);
 
         let inosused = if fs_v2 {
