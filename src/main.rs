@@ -1630,6 +1630,11 @@ impl<'a> Filesystem for FFS<'a> {
         reply.data(&data[offset as usize..(offset as usize + size)]);
     }
 
+    /// Read directory.
+    /// Send a buffer filled using buffer.fill(), with size not exceeding the
+    /// requested size. Send an empty buffer on end of stream. fh will contain the
+    /// value set by the opendir method, or will be undefined if the opendir method
+    /// didn't set any value.
     fn readdir(
         &mut self,
         _req: &Request,
@@ -1658,6 +1663,56 @@ impl<'a> Filesystem for FFS<'a> {
             };
 
             if reply.add((direct.d_ino - 1) as u64, (i + 1) as i64, kind, name) {
+                break;
+            }
+        }
+
+        reply.ok();
+    }
+
+    /// Read directory.
+    /// Send a buffer filled using buffer.fill(), with size not exceeding the
+    /// requested size. Send an empty buffer on end of stream. fh will contain the
+    /// value set by the opendir method, or will be undefined if the opendir method
+    /// didn't set any value.
+    fn readdirplus(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        info!("readdirplus: ino={}, offset={}", ino, offset);
+
+        let inumber = ino + 1;
+
+        let directs = self.fs.dir_read(self.buf, inumber as usize);
+
+        for (i, (direct, name)) in directs.into_iter().enumerate() {
+            if i <= offset as usize {
+                continue;
+            }
+
+            let kind = if direct.d_type & DT_DIR > 0 {
+                FileType::Directory
+            } else if direct.d_type & DT_REG > 0 {
+                FileType::RegularFile
+            } else {
+                continue;
+            };
+
+            let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
+
+            let ino = (direct.d_ino - 1) as u64;
+            if reply.add(
+                ino,
+                (i + 1) as i64,
+                name,
+                &TTL,
+                &dinode_attr(ino, &dinode),
+                0,
+            ) {
                 break;
             }
         }
