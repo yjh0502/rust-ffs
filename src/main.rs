@@ -731,7 +731,6 @@ impl Fs {
             if read != self.fs_bsize as usize {
                 let c = self.dtog(blk as i32);
                 let bno = self.dtogd(blk as i32) as usize;
-                let cg = self.cg(buf, c as usize);
 
                 let blksfreemap = self.cg_blksfree(buf, c as usize);
                 let bitmap = blksfreemap[bno >> 3];
@@ -1029,7 +1028,7 @@ impl Fs {
             let found = self
                 .dirparseblk(&blkbuf)
                 .into_iter()
-                .find(|(direct, filename)| *filename == name)
+                .find(|(_direct, filename)| *filename == name)
                 .is_some();
 
             if !found {
@@ -1069,8 +1068,6 @@ impl Fs {
         let c = 0;
 
         let ino = {
-            let cgbuf = self.cgbuf_mut(buf, c);
-
             let map = self.cg_inosused_mut(buf, c);
             let mut ino = 0usize;
             while ino < self.fs_ipg as usize {
@@ -1321,25 +1318,27 @@ fn dinode_attr(ino: u64, dinode: &Ufs2Dinode) -> FileAttr {
 }
 
 impl<'a> Filesystem for FFS<'a> {
+    /// Look up a directory entry by name and get its attributes.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         info!("lookup: parent={}, name={:?}", parent, name);
 
-        let inumber = parent + 1;
-        for (direct, direct_name) in self.fs.dir_read(self.buf, inumber as usize) {
-            if direct_name != name {
-                continue;
+        let inumber_p = parent + 1;
+        let name = name.to_str().unwrap();
+        let direct = match self.fs.dir_lookup(self.buf, inumber_p as usize, name) {
+            Some(direct) => direct,
+            None => {
+                reply.error(ENOENT);
+                return;
             }
+        };
 
-            let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
+        let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
 
-            let inumber = direct.d_ino as u64 - 1;
-            reply.entry(&TTL, &dinode_attr(inumber, &dinode), inumber);
-            return;
-        }
-
-        reply.error(ENOENT);
+        let inumber = direct.d_ino as u64 - 1;
+        reply.entry(&TTL, &dinode_attr(inumber, &dinode), inumber);
     }
 
+    /// Get file attributes.
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         let inumber = (ino + 1) as usize;
         info!("getattr: ino={}", ino);
@@ -1353,6 +1352,70 @@ impl<'a> Filesystem for FFS<'a> {
         reply.attr(&TTL, &dinode_attr(ino, &dinode));
     }
 
+    /// Set file attributes.
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let inumber = (ino + 1) as usize;
+        let mut dinode = self.fs.dinode(self.buf, inumber);
+
+        if let Some(mode) = mode {
+            dinode.di_mode = mode as u16;
+        }
+        if let Some(uid) = uid {
+            dinode.di_uid = uid;
+        }
+        if let Some(gid) = gid {
+            dinode.di_gid = gid;
+        }
+        if let Some(size) = size {
+            dinode.di_size = size as u64;
+        }
+        if let Some(atime) = atime {
+            let d = match atime {
+                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
+                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
+            };
+            dinode.di_atime = d.as_secs() as i64;
+            dinode.di_atimensec = d.subsec_nanos() as i32;
+        }
+        if let Some(mtime) = mtime {
+            let d = match mtime {
+                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
+                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
+            };
+            dinode.di_mtime = d.as_secs() as i64;
+            dinode.di_mtimensec = d.subsec_nanos() as i32;
+        }
+        if let Some(ctime) = ctime {
+            let d = ctime.duration_since(UNIX_EPOCH).unwrap();
+            dinode.di_ctime = d.as_secs() as i64;
+            dinode.di_ctimensec = d.subsec_nanos() as i32;
+        }
+        if let Some(flags) = flags {
+            dinode.di_flags = flags;
+        }
+
+        self.fs.dinode_update(self.buf, inumber, &dinode);
+
+        reply.attr(&TTL, &dinode_attr(ino, &dinode));
+    }
+
     /// Create file node.
     /// Create a regular file, character device, block device, fifo or socket node.
     fn mknod(
@@ -1361,8 +1424,8 @@ impl<'a> Filesystem for FFS<'a> {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        umask: u32,
-        rdev: u32,
+        _umask: u32,
+        _rdev: u32,
         reply: ReplyEntry,
     ) {
         let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -1467,7 +1530,7 @@ impl<'a> Filesystem for FFS<'a> {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
-        flags: u32,
+        _flags: u32,
         reply: ReplyEmpty,
     ) {
         let inumber_p = (parent + 1) as usize;
@@ -1542,69 +1605,6 @@ impl<'a> Filesystem for FFS<'a> {
 
         let ino = (inumber - 1) as u64;
         reply.entry(&TTL, &dinode_attr(ino, &dinode), ino);
-    }
-
-    fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
-        atime: Option<TimeOrNow>,
-        mtime: Option<TimeOrNow>,
-        ctime: Option<SystemTime>,
-        fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        flags: Option<u32>,
-        reply: ReplyAttr,
-    ) {
-        let inumber = (ino + 1) as usize;
-        let mut dinode = self.fs.dinode(self.buf, inumber);
-
-        if let Some(mode) = mode {
-            dinode.di_mode = mode as u16;
-        }
-        if let Some(uid) = uid {
-            dinode.di_uid = uid;
-        }
-        if let Some(gid) = gid {
-            dinode.di_gid = gid;
-        }
-        if let Some(size) = size {
-            dinode.di_size = size as u64;
-        }
-        if let Some(atime) = atime {
-            let d = match atime {
-                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
-                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
-            };
-            dinode.di_atime = d.as_secs() as i64;
-            dinode.di_atimensec = d.subsec_nanos() as i32;
-        }
-        if let Some(mtime) = mtime {
-            let d = match mtime {
-                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
-                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
-            };
-            dinode.di_mtime = d.as_secs() as i64;
-            dinode.di_mtimensec = d.subsec_nanos() as i32;
-        }
-        if let Some(ctime) = ctime {
-            let d = ctime.duration_since(UNIX_EPOCH).unwrap();
-            dinode.di_ctime = d.as_secs() as i64;
-            dinode.di_ctimensec = d.subsec_nanos() as i32;
-        }
-        if let Some(flags) = flags {
-            dinode.di_flags = flags;
-        }
-
-        self.fs.dinode_update(self.buf, inumber, &dinode);
-
-        reply.attr(&TTL, &dinode_attr(ino, &dinode));
     }
 
     fn read(
@@ -1693,14 +1693,6 @@ impl<'a> Filesystem for FFS<'a> {
             if i <= offset as usize {
                 continue;
             }
-
-            let kind = if direct.d_type & DT_DIR > 0 {
-                FileType::Directory
-            } else if direct.d_type & DT_REG > 0 {
-                FileType::RegularFile
-            } else {
-                continue;
-            };
 
             let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
 
