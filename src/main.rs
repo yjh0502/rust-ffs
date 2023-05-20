@@ -1296,7 +1296,6 @@ impl<'a> Filesystem for FFS<'a> {
             }
 
             let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
-            eprintln!("direct={:?}, dinode={:?}", direct, dinode);
 
             let inumber = direct.d_ino as u64 - 1;
             reply.entry(&TTL, &dinode_attr(inumber, &dinode), inumber);
@@ -1315,8 +1314,6 @@ impl<'a> Filesystem for FFS<'a> {
             reply.error(ENOENT);
             return;
         }
-
-        eprintln!("dinode={:?}", dinode);
 
         reply.attr(&TTL, &dinode_attr(ino, &dinode));
     }
@@ -1385,7 +1382,6 @@ impl<'a> Filesystem for FFS<'a> {
             d_type: DT_REG,
             d_namlen: name.len() as u8,
         };
-        eprintln!("mknod direct={:?}", direct);
         self.fs
             .dir_append(self.buf, inumber_p, direct, name.as_bytes());
 
@@ -1412,7 +1408,6 @@ impl<'a> Filesystem for FFS<'a> {
                 return;
             }
         };
-        eprintln!("p={}, c={}", inumber_p, inumber);
 
         let mut dinode = self.fs.dinode(self.buf, inumber);
         dinode_p.di_nlink -= 1;
@@ -1479,7 +1474,6 @@ impl<'a> Filesystem for FFS<'a> {
         }
         if let Some(ctime) = ctime {
             let d = ctime.duration_since(UNIX_EPOCH).unwrap();
-            eprintln!("{:?}", d);
             dinode.di_ctime = d.as_secs() as i64;
             dinode.di_ctimensec = d.subsec_nanos() as i32;
         }
