@@ -1,5 +1,6 @@
 use anyhow::Result;
 use log::*;
+use std::time::SystemTime;
 
 // dinode.h
 /* File permissions. */
@@ -62,6 +63,12 @@ union Ufs1DinodeU {
     inumber: u32,     /*   4: Lfs: inode number. */
 }
 
+impl Default for Ufs1DinodeU {
+    fn default() -> Self {
+        Ufs1DinodeU { inumber: 0 }
+    }
+}
+
 impl std::fmt::Debug for Ufs1DinodeU {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         unsafe {
@@ -94,6 +101,31 @@ struct Ufs1Dinode {
     di_uid: u32,          /* 112: File owner. */
     di_gid: u32,          /* 116: File group. */
     di_spare: [i32; 2],   /* 120: Reserved; currently unused */
+}
+
+impl From<Ufs2Dinode> for Ufs1Dinode {
+    fn from(ino: Ufs2Dinode) -> Ufs1Dinode {
+        Ufs1Dinode {
+            di_mode: ino.di_mode,
+            di_nlink: ino.di_nlink,
+            di_u: Ufs1DinodeU::default(),
+            di_size: ino.di_size,
+            di_atime: ino.di_atime as i32,
+            di_mtime: ino.di_mtime as i32,
+            di_ctime: ino.di_ctime as i32,
+            di_mtimensec: ino.di_mtimensec,
+            di_atimensec: ino.di_atimensec,
+            di_ctimensec: ino.di_ctimensec,
+            di_db: ino.di_db.map(|x| x as i32),
+            di_ib: ino.di_ib.map(|x| x as i32),
+            di_flags: ino.di_flags,
+            di_blocks: ino.di_blocks as i32,
+            di_gen: ino.di_gen as u32,
+            di_uid: ino.di_uid,
+            di_gid: ino.di_gid,
+            di_spare: [0; 2],
+        }
+    }
 }
 
 #[repr(C)]
@@ -191,6 +223,15 @@ struct Cg {
 }
 
 impl Fs {
+    fn cg_inosused_mut<'a, 'b>(&'a self, buf: &'b mut [u8], c: usize) -> &'b mut [u8] {
+        let cgbuf = self.cgbuf_mut(buf, c);
+        let (offset, size) = {
+            let cg: &Cg = unsafe { std::mem::transmute(&cgbuf[0]) };
+            (cg.cg_iusedoff as usize, cg.niblk() as usize / 8)
+        };
+        unsafe { std::slice::from_raw_parts_mut(&mut cgbuf[offset], size) }
+    }
+
     fn cg_inosused(&self, buf: &[u8], c: usize) -> &[u8] {
         let cgbuf = self.cgbuf(buf, c);
         let cg: &Cg = unsafe { std::mem::transmute(&cgbuf[0]) };
@@ -545,6 +586,19 @@ enum BlkPos {
     Indirect3(u16, u16, u16),
 }
 
+fn setbit(buf: &mut [u8], idx: usize) {
+    buf[idx / 8] |= 1 << (idx % 8);
+}
+fn clrbit(buf: &mut [u8], idx: usize) {
+    buf[idx / 8] &= !(1 << (idx % 8));
+}
+fn isset(buf: &[u8], idx: usize) -> bool {
+    buf[idx / 8] & (1 << (idx % 8)) != 0
+}
+fn isclr(buf: &[u8], idx: usize) -> bool {
+    buf[idx / 8] & (1 << (idx % 8)) == 0
+}
+
 // extra helpers
 impl Fs {
     fn check0(&self) {
@@ -583,12 +637,17 @@ impl Fs {
         fs_alt.clone()
     }
 
+    fn cgbuf_mut<'a, 'b>(&'a self, buf: &'b mut [u8], c: usize) -> &'b mut [u8] {
+        assert!(c <= self.fs_ncg as usize);
+
+        let offset = self.fsbtodb(self.cgtod(c as i32)) as usize * DEV_BSIZE;
+        &mut buf[offset..(offset + self.fs_cgsize as usize)]
+    }
+
     fn cgbuf<'a, 'b>(&'a self, buf: &'b [u8], c: usize) -> &'b [u8] {
         assert!(c <= self.fs_ncg as usize);
 
-        let blk = self.cgtod(c as i32);
-        let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
-
+        let offset = self.fsbtodb(self.cgtod(c as i32)) as usize * DEV_BSIZE;
         &buf[offset..(offset + self.fs_cgsize as usize)]
     }
 
@@ -598,6 +657,12 @@ impl Fs {
         assert_eq!(cg.cg_magic, CG_MAGIC);
 
         cg.clone()
+    }
+
+    fn blk0_mut<'a, 'b>(&'a self, buf: &'b mut [u8], blk: i32) -> &'b mut [u8] {
+        let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
+        assert!(offset + self.fs_bsize as usize <= buf.len());
+        &mut buf[offset..offset + self.fs_bsize as usize]
     }
 
     fn blk0<'a, 'b>(&'a self, buf: &'b [u8], blk: i32) -> &'b [u8] {
@@ -697,7 +762,36 @@ impl Fs {
         }
     }
 
-    fn readat<'a, 'b>(&'a self, buf: &'a [u8], ino: &'b Ufs2Dinode, blkno: usize) -> &'a [u8] {
+    fn blkat_mut<'a, 'b, 'c>(
+        &'a self,
+        buf: &'b mut [u8],
+        ino: &'c Ufs2Dinode,
+        blkno: usize,
+    ) -> &'b mut [u8] {
+        match self.blkpos(blkno) {
+            BlkPos::Direct(blkno) => {
+                let blk = ino.di_db[blkno as usize];
+                self.blk0_mut(buf, blk as i32)
+            }
+            BlkPos::Indirect1(b0) => {
+                let indir0 = self.blk_indir(buf, ino.di_ib[0] as i32);
+                self.blk0_mut(buf, indir0[b0 as usize] as i32)
+            }
+            BlkPos::Indirect2(b0, b1) => {
+                let indir0 = self.blk_indir(buf, ino.di_ib[1] as i32);
+                let indir1 = self.blk_indir(buf, indir0[b0 as usize]);
+                self.blk0_mut(buf, indir1[b1 as usize] as i32)
+            }
+            BlkPos::Indirect3(b0, b1, b2) => {
+                let indir0 = self.blk_indir(buf, ino.di_ib[2] as i32);
+                let indir1 = self.blk_indir(buf, indir0[b0 as usize]);
+                let indir2 = self.blk_indir(buf, indir1[b1 as usize]);
+                self.blk0_mut(buf, indir2[b2 as usize] as i32)
+            }
+        }
+    }
+
+    fn blkat<'a, 'b>(&'a self, buf: &'a [u8], ino: &'b Ufs2Dinode, blkno: usize) -> &'a [u8] {
         match self.blkpos(blkno) {
             BlkPos::Direct(blkno) => {
                 let blk = ino.di_db[blkno as usize];
@@ -754,8 +848,28 @@ impl Fs {
         self.fs_magic == FS_UFS2_MAGIC
     }
 
+    fn dinode_set<'a, 'b>(&self, buf: &mut [u8], inumber: usize, inode: &Ufs2Dinode) {
+        let blk = self.ino_to_fsba(inumber as i32);
+        let blk_offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
+
+        let ino_size = if self.v2() {
+            std::mem::size_of::<Ufs2Dinode>()
+        } else {
+            std::mem::size_of::<Ufs1Dinode>()
+        } as u32;
+
+        let offset = blk_offset + (self.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
+
+        if self.v2() {
+            let dinode: &mut Ufs2Dinode = unsafe { std::mem::transmute(&mut buf[offset]) };
+            *dinode = *inode;
+        } else {
+            let dinode: &mut Ufs1Dinode = unsafe { std::mem::transmute(&mut buf[offset]) };
+            *dinode = Ufs1Dinode::from(*inode);
+        };
+    }
+
     fn dinode(&self, buf: &[u8], inumber: usize) -> Ufs2Dinode {
-        // TODO
         let blk = self.ino_to_fsba(inumber as i32);
         let blk_offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
 
@@ -778,7 +892,7 @@ impl Fs {
         ino
     }
 
-    fn parsedirblk<'a>(&'a self, blk: &'a [u8]) -> Vec<(&'a Direct, &'a str)> {
+    fn dirparseblk<'a>(&'a self, blk: &'a [u8]) -> Vec<(&'a Direct, &'a str)> {
         let mut out = Vec::new();
 
         let mut blkdata = blk;
@@ -807,7 +921,7 @@ impl Fs {
         out
     }
 
-    fn readdir<'a>(&'a self, buf: &'a [u8], inumber: usize) -> Vec<(&'a Direct, &'a str)> {
+    fn dir_read<'a>(&'a self, buf: &'a [u8], inumber: usize) -> Vec<(&'a Direct, &'a str)> {
         let ino = self.dinode(buf, inumber);
 
         let mode = ino.di_mode as usize & IFMT;
@@ -818,12 +932,81 @@ impl Fs {
         let mut out = Vec::new();
         let nblk = ino.di_size as usize / DEV_BSIZE;
         for blkno in 0..nblk {
-            let buf = self.readat(buf, &ino, blkno);
-            let dirs = self.parsedirblk(&buf);
+            let buf = self.blkat(buf, &ino, blkno);
+            let dirs = self.dirparseblk(&buf);
             out.extend(dirs);
         }
 
         out
+    }
+
+    fn dir_append(&self, buf: &mut [u8], inumber: usize, direct: Direct, name: &[u8]) {
+        let ino = self.dinode(buf, inumber);
+        let nblk = ino.di_size as usize / DEV_BSIZE;
+        assert!(nblk > 0);
+
+        let lastblk = nblk - 1;
+
+        let blk = self.blkat_mut(buf, &ino, lastblk);
+
+        let mut blkdata = blk;
+        while blkdata.len() >= directsiz(0) {
+            let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
+            info!("dp={:?}", dp);
+            if dp.d_ino != 0 {
+                let sz = directsiz(dp.d_namlen);
+                blkdata = &mut blkdata[sz..];
+                continue;
+            }
+
+            let sz = directsiz(dp.d_namlen);
+            assert!(sz <= blkdata.len());
+            break;
+        }
+
+        // write direct
+        {
+            let dp: &mut Direct = unsafe { std::mem::transmute(&mut blkdata[0]) };
+            *dp = direct;
+        }
+
+        // write name
+        {
+            let namebuf: &mut [u8] = unsafe {
+                let buf: *mut u8 = std::mem::transmute(&mut blkdata[std::mem::size_of::<Direct>()]);
+                std::slice::from_raw_parts_mut(buf, direct.d_namlen as usize)
+            };
+            namebuf.copy_from_slice(name);
+        }
+    }
+
+    fn allocinode<'a, 'b>(&'a self, buf: &'b mut [u8], dinode: &Ufs2Dinode) -> usize {
+        let c = 0;
+
+        let ino = {
+            let cgbuf = self.cgbuf_mut(buf, c);
+            let cg: &Cg = unsafe { std::mem::transmute(&cgbuf[0]) };
+
+            let map = self.cg_inosused_mut(buf, c);
+            let mut ino = 0usize;
+            while ino < self.fs_ipg as usize {
+                if !isset(map, ino) {
+                    break;
+                }
+                ino += 1;
+            }
+            if ino == self.fs_ipg as usize {
+                panic!("out of inodes");
+            }
+
+            //TODO: cg.cg_initediblk
+
+            ino
+        };
+
+        self.dinode_set(buf, ino, dinode);
+
+        ino
     }
 }
 
@@ -893,7 +1076,7 @@ fn fsck(buf: &[u8]) {
         };
 
         info!(
-            "inoused={}, {}/{:?}",
+            "inosused={}, {}/{:?}",
             inosused,
             inosusedmap.len(),
             inosusedmap,
@@ -940,7 +1123,7 @@ fn fsck(buf: &[u8]) {
             }
 
             // indirect blocks
-            {
+            if ndb > NDADDR as u64 {
                 let mut nib = 0;
                 let mut ndb = ndb - NDADDR as u64;
                 while ndb > 0 {
@@ -1021,7 +1204,7 @@ use std::time::{Duration, UNIX_EPOCH};
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
 struct FFS<'a> {
-    buf: &'a [u8],
+    buf: &'a mut [u8],
     fs: Fs,
 }
 
@@ -1058,20 +1241,12 @@ impl<'a> Filesystem for FFS<'a> {
         info!("lookup: parent={}, name={:?}", parent, name);
 
         let inumber = parent + 1;
-        for (direct, direct_name) in self.fs.readdir(self.buf, inumber as usize) {
+        for (direct, direct_name) in self.fs.dir_read(self.buf, inumber as usize) {
             if direct_name != name {
                 continue;
             }
 
             let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
-
-            let kind = if dinode.di_mode & IFDIR as u16 > 0 {
-                FileType::Directory
-            } else if dinode.di_mode & IFREG as u16 > 0 {
-                FileType::RegularFile
-            } else {
-                continue;
-            };
 
             let inumber = direct.d_ino as u64 - 1;
             reply.entry(&TTL, &dinode_attr(inumber, &dinode), inumber);
@@ -1086,6 +1261,147 @@ impl<'a> Filesystem for FFS<'a> {
 
         let dinode = self.fs.dinode(self.buf, (ino + 1) as usize);
         eprintln!("dinode={:?}", dinode);
+
+        reply.attr(&TTL, &dinode_attr(ino, &dinode));
+    }
+
+    /// Create file node.
+    /// Create a regular file, character device, block device, fifo or socket node.
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        debug!(
+            "[Not Implemented] mknod(parent: {:#x?}, name: {:?}, mode: {}, \
+            umask: {:#x?}, rdev: {})",
+            parent, name, mode, umask, rdev
+        );
+
+        let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d,
+            Err(_) => {
+                reply.error(libc::ENOSYS);
+                return;
+            }
+        };
+
+        let inumber_parent = (parent + 1) as usize;
+        let dinode_parent = self.fs.dinode(self.buf, inumber_parent);
+        info!("dinode_parent={:?}", dinode_parent);
+
+        let epoch = d.as_secs() as i64;
+        let epoch_ns = d.subsec_nanos() as i32;
+
+        let dinode = Ufs2Dinode {
+            di_mode: mode as u16,
+            di_nlink: 1,
+            di_uid: 1, //TODO
+            di_gid: 1, //TODO
+            di_blksize: 0,
+            di_size: 0,
+            di_blocks: 0,
+            di_atime: epoch,
+            di_mtime: epoch,
+            di_ctime: epoch,
+            di_birthtime: epoch,
+            di_mtimensec: epoch_ns,
+            di_atimensec: epoch_ns,
+            di_ctimensec: epoch_ns,
+            di_birthnsec: epoch_ns,
+            di_gen: 0,
+            di_kernflags: 0,
+            di_flags: 0,
+            di_extsize: 0,
+            di_extb: [0i64; NXADDR],
+            di_db: [0i64; NDADDR],
+            di_ib: [0i64; NIADDR],
+            di_spare: [0i64; 3],
+        };
+
+        let inumber = self.fs.allocinode(self.buf, &dinode);
+
+        let name = name.to_str().unwrap();
+
+        let direct = Direct {
+            d_ino: inumber as u32,
+            d_reclen: 0,
+            d_type: DT_REG,
+            d_namlen: name.len() as u8,
+        };
+
+        self.fs
+            .dir_append(self.buf, inumber_parent, direct, name.as_bytes());
+
+        let ino = (inumber - 1) as u64;
+        reply.entry(&TTL, &dinode_attr(ino, &dinode), ino);
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let inumber = (ino + 1) as usize;
+        let mut dinode = self.fs.dinode(self.buf, inumber);
+
+        if let Some(mode) = mode {
+            dinode.di_mode = mode as u16;
+        }
+        if let Some(uid) = uid {
+            dinode.di_uid = uid;
+        }
+        if let Some(gid) = gid {
+            dinode.di_gid = gid;
+        }
+        if let Some(size) = size {
+            dinode.di_size = size as u64;
+        }
+        if let Some(atime) = atime {
+            let d = match atime {
+                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
+                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
+            };
+            dinode.di_atime = d.as_secs() as i64;
+            dinode.di_atimensec = d.subsec_nanos() as i32;
+        }
+        if let Some(mtime) = mtime {
+            let d = match mtime {
+                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
+                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
+            };
+            dinode.di_mtime = d.as_secs() as i64;
+            dinode.di_mtimensec = d.subsec_nanos() as i32;
+        }
+        if let Some(ctime) = ctime {
+            let d = ctime.duration_since(UNIX_EPOCH).unwrap();
+            eprintln!("{:?}", d);
+            dinode.di_ctime = d.as_secs() as i64;
+            dinode.di_ctimensec = d.subsec_nanos() as i32;
+        }
+        if let Some(flags) = flags {
+            dinode.di_flags = flags;
+        }
+
+        self.fs.dinode_set(self.buf, inumber, &dinode);
 
         reply.attr(&TTL, &dinode_attr(ino, &dinode));
     }
@@ -1125,7 +1441,7 @@ impl<'a> Filesystem for FFS<'a> {
 
         let inumber = ino + 1;
 
-        let directs = self.fs.readdir(self.buf, inumber as usize);
+        let directs = self.fs.dir_read(self.buf, inumber as usize);
 
         for (i, (direct, name)) in directs.into_iter().enumerate() {
             if i <= offset as usize {
@@ -1153,7 +1469,7 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let filepath = std::env::args().nth(1).expect("usage: cmd <file>");
-    let file = std::fs::read(filepath)?;
+    let mut file = std::fs::read(filepath)?;
 
     fsck(&file);
 
@@ -1164,7 +1480,7 @@ fn main() -> Result<()> {
         MountOption::FSName("ffs".to_string()),
     ];
 
-    let buf = file.as_slice();
+    let buf = file.as_mut_slice();
     let fs = fs(buf);
     let ffs = FFS { buf, fs };
     fuser::mount2(ffs, "mnt", &options).unwrap();
