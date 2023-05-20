@@ -158,7 +158,7 @@ impl From<Ufs1Dinode> for Ufs2Dinode {
 const CG_MAGIC: i32 = 0x090255;
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Cg {
     cg_firstfield: i32,       /* historic cyl groups linked list */
     cg_magic: i32,            /* magic number */
@@ -285,7 +285,7 @@ const MAXFRAG: usize = 8;
  * super block.
  */
 #[repr(C)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Csum {
     cs_ndir: i32,   /* number of directories */
     cs_nbfree: i32, /* number of free blocks */
@@ -294,7 +294,7 @@ struct Csum {
 }
 
 #[repr(C)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CsumTotal {
     cs_ndir: i64,       /* number of directories */
     cs_nbfree: i64,     /* number of free blocks */
@@ -304,7 +304,7 @@ struct CsumTotal {
 }
 
 #[repr(C)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Fs {
     fs_firstfield: i32, /* historic file system linked list, */
     fs_unused_1: i32,   /*     used for incore super blocks */
@@ -583,24 +583,24 @@ impl Fs {
         );
     }
 
-    fn fs_alt<'a>(&'a self, buf: &'a [u8]) -> &'a Self {
+    fn fs_alt(&self, buf: &[u8]) -> Self {
         let blk_alt = self.cgsblock(self.fs_ncg as i32 - 1);
         let offset_alt = self.fsbtodb(blk_alt) as usize * DEV_BSIZE;
 
         let fs_alt: &Fs = unsafe { std::mem::transmute(&buf[offset_alt]) };
-        fs_alt
+        fs_alt.clone()
     }
 
-    fn cg<'a>(&'a self, buf: &'a [u8], c: usize) -> &'a Cg {
+    fn cg(&self, buf: &[u8], c: usize) -> Cg {
         assert!(c <= self.fs_ncg as usize);
 
         let blk = self.cgtod(c as i32);
         let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
 
-        let cg: &'a Cg = unsafe { std::mem::transmute(&buf[offset]) };
+        let cg: &Cg = unsafe { std::mem::transmute(&buf[offset]) };
         assert_eq!(cg.cg_magic, CG_MAGIC);
 
-        cg
+        cg.clone()
     }
 
     fn blk0<'a, 'b>(&'a self, buf: &'b [u8], blk: i32) -> &'b [u8] {
@@ -617,7 +617,7 @@ impl Fs {
         &buf[offset..offset + len]
     }
 
-    fn blk_indir<'a>(&'a self, buf: &'a [u8], blk: i32) -> &'a [i32] {
+    fn blk_indir<'a, 'b>(&'a self, buf: &'b [u8], blk: i32) -> &'b [i32] {
         let indir = self.blk0(buf, blk as i32);
         unsafe {
             let ptr: *const i32 = std::mem::transmute(indir.as_ptr());
@@ -666,7 +666,7 @@ impl Fs {
         }
     }
 
-    fn blkpos<'a>(&'a self, ino: &'a Ufs2Dinode, blkno: usize) -> BlkPos {
+    fn blkpos<'a>(&'a self, blkno: usize) -> BlkPos {
         if blkno < NDADDR {
             return BlkPos::Direct(blkno as u16);
         }
@@ -701,7 +701,7 @@ impl Fs {
     }
 
     fn readat<'a, 'b>(&'a self, buf: &'a [u8], ino: &'b Ufs2Dinode, blkno: usize) -> &'a [u8] {
-        match self.blkpos(ino, blkno) {
+        match self.blkpos(blkno) {
             BlkPos::Direct(blkno) => {
                 let blk = ino.di_db[blkno as usize];
                 self.blk0(buf, blk as i32)
@@ -843,7 +843,7 @@ struct Bufarea {
     b_dirty: usize,
 }
 
-fn fs(buf: &[u8]) -> &Fs {
+fn fs(buf: &[u8]) -> Fs {
     for offset in SBLOCKSEARCH {
         if offset + SBSIZE >= buf.len() {
             continue;
@@ -861,7 +861,7 @@ fn fs(buf: &[u8]) -> &Fs {
             continue;
         }
 
-        return fs;
+        return fs.clone();
     }
     todo!();
 }
@@ -1025,7 +1025,7 @@ const TTL: Duration = Duration::from_secs(1); // 1 second
 
 struct FFS<'a> {
     buf: &'a [u8],
-    fs: &'a Fs,
+    fs: Fs,
 }
 
 fn dinode_attr(ino: u64, dinode: &Ufs2Dinode) -> FileAttr {
@@ -1169,7 +1169,7 @@ fn main() -> Result<()> {
 
     let buf = file.as_slice();
     let fs = fs(buf);
-    let ffs = FFS { buf, fs: &fs };
+    let ffs = FFS { buf, fs };
     fuser::mount2(ffs, "mnt", &options).unwrap();
 
     Ok(())
