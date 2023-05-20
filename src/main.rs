@@ -456,10 +456,10 @@ impl Fs {
      * This maps file system blocks to DEV_BSIZE (a.k.a. 512-byte) size disk
      * blocks.
      */
-    fn fsbtodb(&self, b: i32) -> i32 {
+    fn fsbtodb(&self, b: i64) -> i64 {
         b << self.fs_fsbtodb
     }
-    fn dbtofsb(&self, b: i32) -> i32 {
+    fn dbtofsb(&self, b: i64) -> i64 {
         b >> self.fs_fsbtodb
     }
 
@@ -467,35 +467,35 @@ impl Fs {
      * Cylinder group macros to locate things in cylinder groups.
      * They calc file system addresses of cylinder group data structures.
      */
-    fn cgbase(&self, c: i32) -> i32 {
-        self.fs_fpg * c
+    fn cgbase(&self, c: i64) -> i64 {
+        self.fs_fpg as i64 * c
     }
     /* data zone */
-    fn cgdata(&self, c: i32) -> i32 {
-        self.cgdmin(c) + self.fs_minfree
+    fn cgdata(&self, c: i64) -> i64 {
+        self.cgdmin(c) + self.fs_minfree as i64
     }
     /* meta data */
-    fn cgmeta(&self, c: i32) -> i32 {
+    fn cgmeta(&self, c: i64) -> i64 {
         self.cgdmin(c)
     }
     /* 1st data */
-    fn cgdmin(&self, c: i32) -> i32 {
-        self.cgstart(c) + self.fs_dblkno
+    fn cgdmin(&self, c: i64) -> i64 {
+        self.cgstart(c) + self.fs_dblkno as i64
     }
     /* inode blk */
-    fn cgimin(&self, c: i32) -> i32 {
-        self.cgstart(c) + self.fs_iblkno
+    fn cgimin(&self, c: i64) -> i64 {
+        self.cgstart(c) + self.fs_iblkno as i64
     }
     /* super blk */
-    fn cgsblock(&self, c: i32) -> i32 {
-        self.cgstart(c) + self.fs_sblkno
+    fn cgsblock(&self, c: i64) -> i64 {
+        self.cgstart(c) + self.fs_sblkno as i64
     }
     /* cg block */
-    fn cgtod(&self, c: i32) -> i32 {
-        self.cgstart(c) + self.fs_cblkno
+    fn cgtod(&self, c: i64) -> i64 {
+        self.cgstart(c) + self.fs_cblkno as i64
     }
-    fn cgstart(&self, c: i32) -> i32 {
-        self.cgbase(c) + self.fs_cgoffset * (c & !self.fs_cgmask)
+    fn cgstart(&self, c: i64) -> i64 {
+        self.cgbase(c) + self.fs_cgoffset as i64 * (c & !self.fs_cgmask as i64)
     }
 
     /*
@@ -504,39 +504,39 @@ impl Fs {
      *     inode number to cylinder group number.
      *     inode number to file system block address.
      */
-    fn ino_to_cg(&self, x: i32) -> i32 {
-        x / self.fs_ipg as i32
+    fn ino_to_cg(&self, x: i64) -> i64 {
+        x / self.fs_ipg as i64
     }
-    fn ino_to_fsba(&self, x: i32) -> i32 {
+    fn ino_to_fsba(&self, x: i64) -> i64 {
         self.cgimin(self.ino_to_cg(x))
-            + self.blkstofrags((x % self.fs_ipg as i32) / self.fs_inopb as i32)
+            + self.blkstofrags((x % self.fs_ipg as i64) / self.fs_inopb as i64)
     }
-    fn ino_to_fsbo(&self, x: i32) -> i32 {
-        x % self.fs_inopb as i32
+    fn ino_to_fsbo(&self, x: i64) -> i64 {
+        x % self.fs_inopb as i64
     }
 
     /*
      * Give cylinder group number for a file system block.
      * Give frag block number in cylinder group for a file system block.
      */
-    fn dtog(&self, d: i32) -> i32 {
-        d / self.fs_fpg
+    fn dtog(&self, d: i64) -> i64 {
+        d / self.fs_fpg as i64
     }
-    fn dtogd(&self, d: i32) -> i32 {
-        d % self.fs_fpg
+    fn dtogd(&self, d: i64) -> i64 {
+        d % self.fs_fpg as i64
     }
 
     /*
      * Number of disk sectors per block/fragment; assumes DEV_BSIZE byte
      * sector size.
      */
-    fn nspb(&self) -> i32 {
-        self.fs_nspf << self.fs_fragshift
+    fn nspb(&self) -> i64 {
+        (self.fs_nspf as i64) << (self.fs_fragshift as i64)
     }
 
     /* Number of inodes per file system fragment (fs->fs_fsize) */
-    fn inopf(&self) -> i32 {
-        self.fs_inopb as i32 >> self.fs_fragshift
+    fn inopf(&self) -> i64 {
+        self.fs_inopb as i64 >> self.fs_fragshift as i64
     }
 
     /*
@@ -564,14 +564,14 @@ impl Fs {
         ((frags) >> (fs)->fs_fragshift)
         */
     /* calculates (blks * fs->fs_frag) */
-    fn blkstofrags(&self, blks: i32) -> i32 {
-        blks << self.fs_fragshift
+    fn blkstofrags(&self, blks: i64) -> i64 {
+        blks << self.fs_fragshift as i64
     }
-    fn fragnum(&self, fsb: i32) -> i32 {
-        fsb & (self.fs_frag - 1)
+    fn fragnum(&self, fsb: i64) -> i64 {
+        fsb & (self.fs_frag as i64 - 1)
     }
-    fn blknum(&self, fsb: i32) -> i32 {
-        fsb & !(self.fs_frag - 1)
+    fn blknum(&self, fsb: i64) -> i64 {
+        fsb & !(self.fs_frag as i64 - 1)
     }
 }
 
@@ -656,14 +656,16 @@ impl Fs {
         assert!(self.fs_fsize <= self.fs_bsize);
         assert!(self.fs_fsize >= self.fs_bsize / MAXFRAG as i32);
 
-        assert_eq!(
-            self.fs_nindir,
-            self.fs_bsize / std::mem::size_of::<i32>() as i32
-        );
+        let blkidxsz = if self.v2() {
+            std::mem::size_of::<i64>()
+        } else {
+            std::mem::size_of::<i32>()
+        };
+        assert_eq!(self.fs_nindir, self.fs_bsize / blkidxsz as i32);
     }
 
     fn fs_alt(&self, buf: &[u8]) -> Self {
-        let blk_alt = self.cgsblock(self.fs_ncg as i32 - 1);
+        let blk_alt = self.cgsblock(self.fs_ncg as i64 - 1);
         let offset_alt = self.fsbtodb(blk_alt) as usize * DEV_BSIZE;
 
         let fs_alt: &Fs = unsafe { std::mem::transmute(&buf[offset_alt]) };
@@ -673,14 +675,14 @@ impl Fs {
     fn cgbuf_mut<'a, 'b>(&'a self, buf: &'b mut [u8], c: usize) -> &'b mut [u8] {
         assert!(c <= self.fs_ncg as usize);
 
-        let offset = self.fsbtodb(self.cgtod(c as i32)) as usize * DEV_BSIZE;
+        let offset = self.fsbtodb(self.cgtod(c as i64)) as usize * DEV_BSIZE;
         &mut buf[offset..(offset + self.fs_cgsize as usize)]
     }
 
     fn cgbuf<'a, 'b>(&'a self, buf: &'b [u8], c: usize) -> &'b [u8] {
         assert!(c <= self.fs_ncg as usize);
 
-        let offset = self.fsbtodb(self.cgtod(c as i32)) as usize * DEV_BSIZE;
+        let offset = self.fsbtodb(self.cgtod(c as i64)) as usize * DEV_BSIZE;
         &buf[offset..(offset + self.fs_cgsize as usize)]
     }
 
@@ -692,19 +694,19 @@ impl Fs {
         cg.clone()
     }
 
-    fn blk0_mut<'a, 'b>(&'a self, buf: &'b mut [u8], blk: i32) -> &'b mut [u8] {
+    fn blk0_mut<'a, 'b>(&'a self, buf: &'b mut [u8], blk: i64) -> &'b mut [u8] {
         let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
         assert!(offset + self.fs_bsize as usize <= buf.len());
         &mut buf[offset..offset + self.fs_bsize as usize]
     }
 
-    fn blk0<'a, 'b>(&'a self, buf: &'b [u8], blk: i32) -> &'b [u8] {
+    fn blk0<'a, 'b>(&'a self, buf: &'b [u8], blk: i64) -> &'b [u8] {
         let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
         assert!(offset + self.fs_bsize as usize <= buf.len());
         &buf[offset..offset + self.fs_bsize as usize]
     }
 
-    fn blk<'a, 'b>(&'a self, buf: &'b [u8], blk: i32, len: usize) -> &'b [u8] {
+    fn blk<'a, 'b>(&'a self, buf: &'b [u8], blk: i64, len: usize) -> &'b [u8] {
         assert!(len <= self.fs_bsize as usize, "{}", len);
         let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
         assert!(offset + len <= buf.len());
@@ -712,12 +714,27 @@ impl Fs {
         &buf[offset..offset + len]
     }
 
-    fn blk_indir<'a, 'b>(&'a self, buf: &'b [u8], blk: i32) -> &'b [i32] {
-        let indir = self.blk0(buf, blk as i32);
-        unsafe {
-            let ptr: *const i32 = std::mem::transmute(indir.as_ptr());
-            std::slice::from_raw_parts(ptr, self.fs_nindir as usize)
+    fn blk_indir<'a, 'b>(&'a self, buf: &'b [u8], blk: i64) -> Vec<i64> {
+        use std::{mem::transmute, slice::from_raw_parts};
+        let mut v = Vec::with_capacity(self.fs_nindir as usize);
+        let indir = self.blk0(buf, blk);
+
+        if self.v2() {
+            let s = unsafe {
+                from_raw_parts::<i64>(transmute(indir.as_ptr()), self.fs_nindir as usize)
+            };
+            for i in 0..self.fs_nindir as usize {
+                v.push(s[i]);
+            }
+        } else {
+            let s = unsafe {
+                from_raw_parts::<i32>(transmute(indir.as_ptr()), self.fs_nindir as usize)
+            };
+            for i in 0..self.fs_nindir as usize {
+                v.push(s[i] as i64);
+            }
         }
+        v
     }
 
     fn read_indir(&self, buf: &[u8], ino: &Ufs2Dinode, blk: i64, depth: usize, out: &mut Vec<u8>) {
@@ -729,8 +746,8 @@ impl Fs {
             let remain = ino.di_size as usize - out.len();
             let read = remain.min(self.fs_bsize as usize);
             if read != self.fs_bsize as usize {
-                let c = self.dtog(blk as i32);
-                let bno = self.dtogd(blk as i32) as usize;
+                let c = self.dtog(blk);
+                let bno = self.dtogd(blk) as usize;
 
                 let blksfreemap = self.cg_blksfree(buf, c as usize);
                 let bitmap = blksfreemap[bno >> 3];
@@ -739,20 +756,20 @@ impl Fs {
                     "read_indir: c={}, blk={}/{}/{}, {:08b}, fraglen={}/{}",
                     c,
                     blk,
-                    self.blknum(blk as i32),
-                    self.fragnum(blk as i32),
+                    self.blknum(blk),
+                    self.fragnum(blk),
                     bitmap,
                     read,
                     howmany(read, self.fs_fsize as usize)
                 );
             }
-            out.extend_from_slice(self.blk(buf, blk as i32, read));
+            out.extend_from_slice(self.blk(buf, blk, read));
             return;
         }
 
-        let blks: &[i32] = self.blk_indir(buf, blk as i32);
+        let blks = self.blk_indir(buf, blk as i64);
         for blk_child in blks {
-            let blk_child = *blk_child as i64;
+            let blk_child = blk_child;
             if blk_child == 0 {
                 break;
             }
@@ -803,22 +820,22 @@ impl Fs {
         match self.blkpos(blkno) {
             BlkPos::Direct(blkno) => {
                 let blk = ino.di_db[blkno as usize];
-                self.blk0_mut(buf, blk as i32)
+                self.blk0_mut(buf, blk)
             }
             BlkPos::Indirect1(b0) => {
-                let indir0 = self.blk_indir(buf, ino.di_ib[0] as i32);
-                self.blk0_mut(buf, indir0[b0 as usize] as i32)
+                let indir0 = self.blk_indir(buf, ino.di_ib[0]);
+                self.blk0_mut(buf, indir0[b0 as usize])
             }
             BlkPos::Indirect2(b0, b1) => {
-                let indir0 = self.blk_indir(buf, ino.di_ib[1] as i32);
+                let indir0 = self.blk_indir(buf, ino.di_ib[1]);
                 let indir1 = self.blk_indir(buf, indir0[b0 as usize]);
-                self.blk0_mut(buf, indir1[b1 as usize] as i32)
+                self.blk0_mut(buf, indir1[b1 as usize])
             }
             BlkPos::Indirect3(b0, b1, b2) => {
-                let indir0 = self.blk_indir(buf, ino.di_ib[2] as i32);
+                let indir0 = self.blk_indir(buf, ino.di_ib[2]);
                 let indir1 = self.blk_indir(buf, indir0[b0 as usize]);
                 let indir2 = self.blk_indir(buf, indir1[b1 as usize]);
-                self.blk0_mut(buf, indir2[b2 as usize] as i32)
+                self.blk0_mut(buf, indir2[b2 as usize])
             }
         }
     }
@@ -827,22 +844,22 @@ impl Fs {
         match self.blkpos(blkno) {
             BlkPos::Direct(blkno) => {
                 let blk = ino.di_db[blkno as usize];
-                self.blk0(buf, blk as i32)
+                self.blk0(buf, blk)
             }
             BlkPos::Indirect1(b0) => {
-                let indir0 = self.blk_indir(buf, ino.di_ib[0] as i32);
-                self.blk0(buf, indir0[b0 as usize] as i32)
+                let indir0 = self.blk_indir(buf, ino.di_ib[0]);
+                self.blk0(buf, indir0[b0 as usize])
             }
             BlkPos::Indirect2(b0, b1) => {
-                let indir0 = self.blk_indir(buf, ino.di_ib[1] as i32);
+                let indir0 = self.blk_indir(buf, ino.di_ib[1]);
                 let indir1 = self.blk_indir(buf, indir0[b0 as usize]);
-                self.blk0(buf, indir1[b1 as usize] as i32)
+                self.blk0(buf, indir1[b1 as usize])
             }
             BlkPos::Indirect3(b0, b1, b2) => {
-                let indir0 = self.blk_indir(buf, ino.di_ib[2] as i32);
+                let indir0 = self.blk_indir(buf, ino.di_ib[2]);
                 let indir1 = self.blk_indir(buf, indir0[b0 as usize]);
                 let indir2 = self.blk_indir(buf, indir1[b1 as usize]);
-                self.blk0(buf, indir2[b2 as usize] as i32)
+                self.blk0(buf, indir2[b2 as usize])
             }
         }
     }
@@ -875,17 +892,19 @@ impl Fs {
 
         out
     }
+}
 
+impl Fs {
     fn v2(&self) -> bool {
         self.fs_magic == FS_UFS2_MAGIC
     }
 
     fn dinode<'a, 'b>(&self, buf: &[u8], inumber: usize) -> Ufs2Dinode {
-        let blkno = self.ino_to_fsba(inumber as i32);
+        let blkno = self.ino_to_fsba(inumber as i64);
         let blkbuf = self.blk0(buf, blkno);
 
         let ino_size = self.fs_bsize as u32 / self.fs_inopb;
-        let offset = (self.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
+        let offset = (self.ino_to_fsbo(inumber as i64) as u64 * ino_size as u64) as usize;
 
         if self.v2() {
             let dinode: &Ufs2Dinode = unsafe { std::mem::transmute(&blkbuf[offset]) };
@@ -900,11 +919,11 @@ impl Fs {
     where
         F: FnOnce(&mut Ufs2Dinode) -> R,
     {
-        let blkno = self.ino_to_fsba(inumber as i32);
+        let blkno = self.ino_to_fsba(inumber as i64);
         let blkbuf = self.blk0_mut(buf, blkno);
 
-        let ino_size = self.fs_bsize as u32 / self.fs_inopb;
-        let offset = (self.ino_to_fsbo(inumber as i32) as u32 * ino_size) as usize;
+        let ino_size = (self.fs_bsize / self.fs_inopb as i32) as u64;
+        let offset = (self.ino_to_fsbo(inumber as i64) as u64 * ino_size) as usize;
 
         if self.v2() {
             let dinode: &mut Ufs2Dinode = unsafe { std::mem::transmute(&mut blkbuf[offset]) };
@@ -923,7 +942,7 @@ impl Fs {
             *inode = Ufs2Dinode::default();
         });
 
-        let c = self.ino_to_cg(inumber as i32) as usize;
+        let c = self.ino_to_cg(inumber as i64) as usize;
         let map = self.cg_inosused_mut(buf, c);
 
         assert!(isset(map, inumber));
@@ -931,7 +950,7 @@ impl Fs {
     }
 
     fn dinode_alloc<'a, 'b>(&self, buf: &mut [u8], inumber: usize, inode: &Ufs2Dinode) {
-        let c = self.ino_to_cg(inumber as i32) as usize;
+        let c = self.ino_to_cg(inumber as i64) as usize;
         let map = self.cg_inosused_mut(buf, c);
 
         assert!(isclr(map, inumber));
@@ -1162,7 +1181,7 @@ fn fsck(buf: &[u8]) {
             inosusedmap.len(),
             inosusedmap,
         );
-        debug!("blkfree={}/{:?}", blksfreemap.len(), blksfreemap,);
+        debug!("blksfree={}/{:?}", blksfreemap.len(), blksfreemap,);
 
         let ino_start = fs.fs_ipg * c;
         let ino_end = ino_start + inosused;
