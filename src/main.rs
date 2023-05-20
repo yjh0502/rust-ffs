@@ -605,7 +605,6 @@ fn direct_append(buf: &mut [u8], direct: Direct, name: &[u8]) {
     let mut blkdata = buf;
     while blkdata.len() >= directsiz(0) {
         let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
-        info!("dp={:?}", dp);
         if dp.d_ino != 0 {
             let sz = directsiz(dp.d_namlen);
             blkdata = &mut blkdata[sz..];
@@ -936,7 +935,7 @@ impl Fs {
         let c = self.ino_to_cg(inumber as i32) as usize;
         let map = self.cg_inosused_mut(buf, c);
 
-        assert!(!isset(map, inumber));
+        assert!(isclr(map, inumber));
         setbit(map, inumber);
 
         self.dinode_update(buf, inumber, inode);
@@ -996,13 +995,29 @@ impl Fs {
         out
     }
 
+    fn dir_lookup(&self, buf: &mut [u8], inumber_p: usize, name: &str) -> Option<Direct> {
+        let dinode = self.dinode(buf, inumber_p);
+
+        let mode = dinode.di_mode as usize & IFMT;
+        assert_ne!(mode & IFDIR, 0);
+
+        let nblk = dinode.di_size as usize / DEV_BSIZE;
+        for blkno in 0..nblk {
+            let buf = self.blkat(buf, &dinode, blkno);
+            for (direct, filename) in self.dirparseblk(&buf) {
+                if filename == name {
+                    return Some(*direct);
+                }
+            }
+        }
+        None
+    }
+
     fn dir_delete(&self, buf: &mut [u8], inumber_p: usize, name: &str) -> Option<Direct> {
         let dinode_p = self.dinode(buf, inumber_p);
 
         let mode = dinode_p.di_mode as usize & IFMT;
-        if mode & IFDIR == 0 {
-            todo!();
-        }
+        assert_ne!(mode & IFDIR, 0);
 
         let mut ret = None;
         let mut blkbuf_out = Vec::with_capacity(self.fs_bsize as usize);
@@ -1484,7 +1499,49 @@ impl<'a> Filesystem for FFS<'a> {
         dinode_p.di_nlink -= 1;
         dinode_newp.di_nlink += 1;
 
+        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
+        self.fs.dinode_update(self.buf, inumber_newp, &dinode_newp);
+
         reply.ok();
+    }
+
+    /// Create a hard link.
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let inumber = (ino + 1) as usize;
+        let inumber_p = (newparent + 1) as usize;
+
+        let mut dinode = self.fs.dinode(self.buf, inumber);
+        let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
+
+        if dinode.di_mode == 0 || dinode_p.di_mode == 0 {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        let newname = newname.to_str().unwrap();
+        let direct = Direct {
+            d_ino: inumber as u32,
+            d_reclen: 0,
+            d_type: DT_REG,
+            d_namlen: newname.len() as u8,
+        };
+        self.fs
+            .dir_append(self.buf, inumber_p, direct, newname.as_bytes());
+
+        dinode.di_nlink += 1;
+        dinode_p.di_nlink += 1;
+        self.fs.dinode_update(self.buf, inumber, &dinode);
+        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
+
+        let ino = (inumber - 1) as u64;
+        reply.entry(&TTL, &dinode_attr(ino, &dinode), ino);
     }
 
     fn setattr(
