@@ -1933,7 +1933,7 @@ impl<'a> Filesystem for FFS<'a> {
         let directs = self.fs.dir_read(self.buf, inumber as usize);
 
         for (i, (direct, name)) in directs.into_iter().enumerate() {
-            if i <= offset as usize {
+            if i < offset as usize {
                 continue;
             }
 
