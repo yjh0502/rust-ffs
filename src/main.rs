@@ -1296,11 +1296,9 @@ impl Fs {
         if dinode.di_blocks & (self.fs_frag as u64 - 1) != 0 {
             todo!();
         }
-        eprintln!("dinode_realloc: ino={:?}", dinode);
-
         let fs_nindir = self.fs_nindir as u16;
         let mut pos_prev = self.blkpos(howmany(dinode.di_blocks as usize, self.fs_frag as usize));
-        let mut pos_next = self.blkpos(howmany(blocks as usize, self.fs_frag as usize));
+        let pos_next = self.blkpos(howmany(blocks as usize, self.fs_frag as usize));
 
         eprintln!(
             "dinode_realloc: {}({:?}) -> {}({:?})",
@@ -1327,7 +1325,6 @@ impl Fs {
                 pos_prev = pos_prev.prev(fs_nindir);
             }
         }
-        eprintln!("dinode_realloc: ino={:?}", dinode);
     }
 
     fn dir_read<'a>(&'a self, buf: &'a [u8], inumber: usize) -> Vec<(&'a Direct, &'a str)> {
@@ -2089,8 +2086,82 @@ impl<'a> Filesystem for FFS<'a> {
         }
 
         let data = self.fs.read(self.buf, &dinode);
+        eprintln!("read dinode={:?} data={:?}", dinode, data);
         let size = std::cmp::min(size as usize, data.len() - offset as usize);
         reply.data(&data[offset as usize..(offset as usize + size)]);
+    }
+
+    /// Write data.
+    /// Write should return exactly the number of bytes requested except on error. An
+    /// exception to this is when the file has been opened in 'direct_io' mode, in
+    /// which case the return value of the write system call will reflect the return
+    /// value of this operation. fh will contain the value set by the open method, or
+    /// will be undefined if the open method didn't set any value.
+    ///
+    /// write_flags: will contain FUSE_WRITE_CACHE, if this write is from the page cache. If set,
+    /// the pid, uid, gid, and fh may not match the value that would have been sent if write cachin
+    /// is disabled
+    /// flags: these are the file flags, such as O_SYNC. Only supported with ABI >= 7.9
+    /// lock_owner: only supported with ABI >= 7.9
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        write_flags: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        let inumber = (ino + 1) as usize;
+        let mut dinode = self.fs.dinode(self.buf, inumber);
+        if dinode.di_mode == 0 {
+            reply.error(ENOENT);
+            return;
+        }
+        if dinode.di_mode as usize & IFDIR == 1 {
+            reply.error(EISDIR);
+            return;
+        }
+
+        let blkstart = offset as usize / self.fs.fs_bsize as usize;
+        let blkend = howmany(offset as usize + data.len(), self.fs.fs_bsize as usize);
+        self.fs.dinode_realloc(
+            self.buf,
+            &mut dinode,
+            blkend as i64 * self.fs.fs_frag as i64,
+        );
+        dinode.di_size = dinode.di_size.max(offset as u64 + data.len() as u64);
+
+        eprintln!("write dinode={:?}", dinode);
+
+        let mut written = 0;
+        for blk in blkstart..blkend {
+            let buf = self.fs.blkat_mut(self.buf, &dinode, blk as usize);
+
+            let bufmin = blk as i64 * self.fs.fs_bsize as i64;
+            let bufmax = (blk + 1) as i64 * self.fs.fs_bsize as i64;
+
+            let srcmin = (bufmin - offset).max(0);
+            let srcmax = (bufmax - offset).min(data.len() as i64);
+            let copylen = srcmax - srcmin;
+
+            let dstmin = (offset - bufmin).max(0);
+            let dstmax = dstmin + copylen;
+
+            let dst = &mut buf[dstmin as usize..dstmax as usize];
+            let src = &data[srcmin as usize..srcmax as usize];
+
+            dst.copy_from_slice(src);
+
+            written += copylen as u32;
+        }
+
+        self.fs.dinode_update(self.buf, inumber, &dinode);
+
+        reply.written(written);
     }
 
     /// Read directory.
