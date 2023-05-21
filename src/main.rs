@@ -1,6 +1,6 @@
 use anyhow::Result;
 use log::*;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // dinode.h
 /* File permissions. */
@@ -182,6 +182,39 @@ impl From<Ufs1Dinode> for Ufs2Dinode {
             di_db: ino.di_db.map(|x| x as i64),
             di_ib: ino.di_ib.map(|x| x as i64),
             di_spare: [0; 3],
+        }
+    }
+}
+
+impl Ufs2Dinode {
+    fn empty(d: Duration) -> Self {
+        let epoch = d.as_secs() as i64;
+        let epoch_ns = d.subsec_nanos() as i32;
+
+        Ufs2Dinode {
+            di_mode: 0,
+            di_nlink: 0,
+            di_uid: 1, //TODO
+            di_gid: 1, //TODO
+            di_blksize: 0,
+            di_size: 0,
+            di_blocks: 0,
+            di_atime: epoch,
+            di_mtime: epoch,
+            di_ctime: epoch,
+            di_birthtime: epoch,
+            di_mtimensec: epoch_ns,
+            di_atimensec: epoch_ns,
+            di_ctimensec: epoch_ns,
+            di_birthnsec: epoch_ns,
+            di_gen: 0,
+            di_kernflags: 0,
+            di_flags: 0,
+            di_extsize: 0,
+            di_extb: [0i64; NXADDR],
+            di_db: [0i64; NDADDR],
+            di_ib: [0i64; NIADDR],
+            di_spare: [0i64; 3],
         }
     }
 }
@@ -561,25 +594,43 @@ impl Fs {
      * quantities by using shifts and masks in place of divisions
      * modulos and multiplications.
      */
+
+    /* calculates (loc % fs->fs_bsize) */
     fn blkoff(&self, loc: i64) -> i64 {
         loc & self.fs_qbmask
     }
+
+    /* calculates (loc % fs->fs_fsize) */
+    fn fragoff(&self, loc: i64) -> i64 {
+        loc & self.fs_qfmask
+    }
+
     /*
-    #define fragoff(fs, loc)	/* calculates (loc % fs->fs_fsize) */ \
-        ((loc) & (fs)->fs_qfmask)
     #define lblktosize(fs, blk)	/* calculates ((off_t)blk * fs->fs_bsize) */ \
         ((off_t)(blk) << (fs)->fs_bshift)
     #define lblkno(fs, loc)		/* calculates (loc / fs->fs_bsize) */ \
         ((loc) >> (fs)->fs_bshift)
-    #define numfrags(fs, loc)	/* calculates (loc / fs->fs_fsize) */ \
-        ((loc) >> (fs)->fs_fshift)
-    #define blkroundup(fs, size)	/* calculates roundup(size, fs->fs_bsize) */ \
-        (((size) + (fs)->fs_qbmask) & (fs)->fs_bmask)
-    #define fragroundup(fs, size)	/* calculates roundup(size, fs->fs_fsize) */ \
-        (((size) + (fs)->fs_qfmask) & (fs)->fs_fmask)
-    #define fragstoblks(fs, frags)	/* calculates (frags / fs->fs_frag) */ \
-        ((frags) >> (fs)->fs_fragshift)
-        */
+    */
+
+    /* calculates (loc / fs->fs_fsize) */
+    fn numfrags(&self, loc: i64) -> i64 {
+        loc >> self.fs_fshift
+    }
+
+    /* calculates roundup(size, fs->fs_bsize) */
+    fn blkroundup(&self, size: i64) -> i64 {
+        (size + self.fs_qbmask) & self.fs_bmask as i64
+    }
+
+    /* calculates roundup(size, fs->fs_fsize) */
+    fn fragroundup(&self, size: i64) -> i64 {
+        (size + self.fs_qfmask) & self.fs_fmask as i64
+    }
+    /* calculates (frags / fs->fs_frag) */
+    fn fragstoblks(&self, frag: i64) -> i64 {
+        frag >> self.fs_fragshift
+    }
+
     /* calculates (blks * fs->fs_frag) */
     fn blkstofrags(&self, blks: i64) -> i64 {
         blks << self.fs_fragshift as i64
@@ -616,38 +667,70 @@ fn isclr(buf: &[u8], idx: usize) -> bool {
     buf[idx / 8] & (1 << (idx % 8)) == 0
 }
 
-fn direct_append(buf: &mut [u8], direct: Direct, name: &[u8]) {
+fn direct_append(blkbuf: &mut [u8], direct: Direct, name: &[u8]) -> usize {
     assert_eq!(direct.d_namlen as usize, name.len());
 
-    let mut blkdata = buf;
-    while blkdata.len() >= directsiz(0) {
-        let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
-        if dp.d_ino != 0 {
-            let sz = directsiz(dp.d_namlen);
-            blkdata = &mut blkdata[sz..];
-            continue;
+    let mut offset = 0;
+    while blkbuf.len() >= offset + directsiz(0) {
+        let dp: &Direct = unsafe { std::mem::transmute(&blkbuf[offset]) };
+        if dp.d_ino == 0 {
+            break;
         }
 
-        break;
+        let sz = directsiz(dp.d_namlen);
+        offset += sz;
+        continue;
     }
 
     let sz = directsiz(name.len() as u8);
-    assert!(sz <= blkdata.len());
+    assert!(offset + sz <= blkbuf.len());
 
     // write direct
     {
-        let dp: &mut Direct = unsafe { std::mem::transmute(&mut blkdata[0]) };
+        let dp: &mut Direct = unsafe { std::mem::transmute(&mut blkbuf[offset]) };
         *dp = direct;
     }
 
     // write name
     {
         let namebuf: &mut [u8] = unsafe {
-            let buf: *mut u8 = std::mem::transmute(&mut blkdata[std::mem::size_of::<Direct>()]);
+            let buf: *mut u8 =
+                std::mem::transmute(&mut blkbuf[offset + std::mem::size_of::<Direct>()]);
             std::slice::from_raw_parts_mut(buf, direct.d_namlen as usize)
         };
         namebuf.copy_from_slice(name);
     }
+
+    offset + sz
+}
+
+fn direct_parse(blk: &[u8]) -> Vec<(&Direct, &str)> {
+    let mut out = Vec::new();
+
+    let mut blkdata = blk;
+    while blkdata.len() >= directsiz(0) {
+        let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
+        if dp.d_ino == 0 {
+            break;
+        }
+
+        let sz = directsiz(dp.d_namlen);
+        let namebuf: &[u8] = unsafe {
+            let buf: *const u8 = std::mem::transmute(&blkdata[std::mem::size_of::<Direct>()]);
+            std::slice::from_raw_parts(buf, dp.d_namlen as usize)
+        };
+
+        blkdata = &blkdata[sz..];
+
+        let filename = if let Ok(s) = std::str::from_utf8(&namebuf) {
+            s
+        } else {
+            "???"
+        };
+
+        out.push((dp, filename));
+    }
+    out
 }
 
 // extra helpers
@@ -713,13 +796,21 @@ impl Fs {
     }
 
     fn blk0_mut<'a, 'b>(&'a self, buf: &'b mut [u8], blk: i64) -> &'b mut [u8] {
-        let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
+        // device block number
+        let dbno = self.fsbtodb(blk) as usize;
+        assert_eq!(dbno & (self.fs_frag as usize - 1), 0);
+
+        let offset = dbno * DEV_BSIZE;
         assert!(offset + self.fs_bsize as usize <= buf.len());
         &mut buf[offset..offset + self.fs_bsize as usize]
     }
 
     fn blk0<'a, 'b>(&'a self, buf: &'b [u8], blk: i64) -> &'b [u8] {
-        let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
+        // device block number
+        let dbno = self.fsbtodb(blk) as usize;
+        // assert_eq!(dbno & (self.fs_frag as usize - 1), 0);
+
+        let offset = dbno * DEV_BSIZE;
         assert!(offset + self.fs_bsize as usize <= buf.len());
         &buf[offset..offset + self.fs_bsize as usize]
     }
@@ -848,8 +939,8 @@ impl Fs {
         while out.len() < ino.di_size as usize {
             let blkno = out.len() / self.fs_bsize as usize;
             let blk = self.blkat(buf, ino, blkno);
-            let blk = &blk[..blk.len().min(ino.di_size as usize - out.len())];
-            out.extend_from_slice(blk);
+            let blkbuf = &blk[..blk.len().min(ino.di_size as usize - out.len())];
+            out.extend_from_slice(blkbuf);
         }
 
         assert!(
@@ -868,10 +959,57 @@ impl Fs {
         self.fs_magic == FS_UFS2_MAGIC
     }
 
-    fn blk_alloc<'a, 'b>(&self, buf: &mut [u8]) -> i32 {
+    fn blk_free<'a, 'b>(&self, buf: &mut [u8], blkno: i64, frags: i64) {
+        let c = self.dtog(blkno) as usize;
+
+        let fragoff = blkno % self.fs_frag as i64;
+        let fragrem = self.fs_frag as i64 - fragoff;
+        assert!(fragrem >= frags);
+        if fragoff == 0 {
+            assert_eq!(frags, 8);
+        }
+
+        // clear bitmap
+        let map = self.cg_blksfree_mut(buf, c);
+        for blk in blkno..(blkno + frags) {
+            assert!(isset(map, blk as usize));
+            clrbit(map, blk as usize);
+        }
+    }
+
+    // allocate whole block
+    fn blk_alloc<'a, 'b>(&self, buf: &mut [u8], nblk: i64) -> i64 {
+        assert_eq!(nblk, 8);
+
         let c = 0;
+        let cg = self.cg(buf, c);
         let blksfreemap = self.cg_blksfree_mut(buf, c);
-        todo!()
+
+        let blks_per_cg = (cg.cg_ndblk / self.fs_frag as u32) as i64;
+        for blk in 0..blks_per_cg {
+            let blkno = self.blkstofrags(blk);
+            let mut filled = false;
+            for i in 0..self.fs_frag as i64 {
+                if isclr(blksfreemap, (blkno + i) as usize) {
+                    filled = true;
+                    break;
+                }
+            }
+
+            if filled {
+                continue;
+            }
+
+            for i in 0..self.fs_frag as i64 {
+                clrbit(blksfreemap, (blkno + i) as usize);
+            }
+            let mut blkbuf = self.blk0_mut(buf, blkno);
+            blkbuf.fill(0);
+
+            // TODO: accounting
+            return blkno;
+        }
+        todo!("blk_alloc");
     }
 
     fn dinode<'a, 'b>(&self, buf: &[u8], inumber: usize) -> Ufs2Dinode {
@@ -940,49 +1078,52 @@ impl Fs {
         })
     }
 
-    fn dirparseblk<'a>(&'a self, blk: &'a [u8]) -> Vec<(&'a Direct, &'a str)> {
-        let mut out = Vec::new();
+    // do not modify di_size, only allocate di_blocks if required
+    fn dinode_realloc(&self, buf: &mut [u8], dinode: &mut Ufs2Dinode, blocks: i64) {
+        if dinode.di_blocks >= blocks as u64 {
+            return;
+        }
 
-        let mut blkdata = blk;
-        while blkdata.len() >= directsiz(0) {
-            let dp: &Direct = unsafe { std::mem::transmute(&blkdata[0]) };
-            if dp.d_ino == 0 {
-                break;
+        // TODO: sample impl
+        if dinode.di_blocks == 0 {
+            for i in 0..NDADDR {
+                dinode.di_db[i] = self.blk_alloc(buf, self.fs_frag as i64);
+                dinode.di_blocks += self.fs_frag as u64;
+                if dinode.di_blocks >= blocks as u64 {
+                    break;
+                }
             }
 
-            let sz = directsiz(dp.d_namlen);
-            let namebuf: &[u8] = unsafe {
-                let buf: *const u8 = std::mem::transmute(&blkdata[std::mem::size_of::<Direct>()]);
-                std::slice::from_raw_parts(buf, dp.d_namlen as usize)
-            };
-
-            blkdata = &blkdata[sz..];
-
-            let filename = if let Ok(s) = std::str::from_utf8(&namebuf) {
-                s
-            } else {
-                "???"
-            };
-
-            out.push((dp, filename));
+            assert!(dinode.di_blocks >= blocks as u64);
+            return;
         }
-        out
+
+        // partial to full block
+        if dinode.di_blocks < self.fs_frag as u64 {
+            todo!();
+        }
+
+        todo!();
     }
 
     fn dir_read<'a>(&'a self, buf: &'a [u8], inumber: usize) -> Vec<(&'a Direct, &'a str)> {
         let dinode = self.dinode(buf, inumber);
+        eprintln!("dir_read: dinode={:?}", dinode);
 
         let mode = dinode.di_mode as usize & IFMT;
         if mode & IFDIR == 0 {
+            todo!();
             return vec![];
         }
 
         let mut out = Vec::new();
-        let nblk = dinode.di_size as usize / DEV_BSIZE;
-        for blkno in 0..nblk {
-            let buf = self.blkat(buf, &dinode, blkno);
-            let dirs = self.dirparseblk(&buf);
+        let mut read = 0;
+        while read < dinode.di_size as usize {
+            let blkno = read / self.fs_bsize as usize;
+            let blkbuf = self.blkat(buf, &dinode, blkno);
+            let dirs = direct_parse(&blkbuf);
             out.extend(dirs);
+            read += blkbuf.len();
         }
 
         out
@@ -994,10 +1135,12 @@ impl Fs {
         let mode = dinode.di_mode as usize & IFMT;
         assert_ne!(mode & IFDIR, 0);
 
-        let nblk = dinode.di_size as usize / DEV_BSIZE;
-        for blkno in 0..nblk {
-            let buf = self.blkat(buf, &dinode, blkno);
-            for (direct, filename) in self.dirparseblk(&buf) {
+        let mut read = 0;
+        while read < dinode.di_size as usize {
+            let blkno = read / self.fs_bsize as usize;
+            let blkbuf = self.blkat(buf, &dinode, blkno);
+            read += blkbuf.len();
+            for (direct, filename) in direct_parse(&blkbuf) {
                 if filename == name {
                     return Some(*direct);
                 }
@@ -1016,11 +1159,13 @@ impl Fs {
         let mut blkbuf_out = Vec::with_capacity(self.fs_bsize as usize);
         blkbuf_out.resize(self.fs_bsize as usize, 0);
 
-        let nblk = dinode_p.di_size as usize / DEV_BSIZE;
-        for blkno in 0..nblk {
+        let mut read = 0;
+        while read < dinode_p.di_size as usize {
+            let blkno = read / self.fs_bsize as usize;
             let blkbuf = self.blkat_mut(buf, &dinode_p, blkno);
-            let found = self
-                .dirparseblk(&blkbuf)
+            read += blkbuf.len();
+
+            let found = direct_parse(&blkbuf)
                 .into_iter()
                 .find(|(_direct, filename)| *filename == name)
                 .is_some();
@@ -1030,7 +1175,7 @@ impl Fs {
             }
 
             let mut found = false;
-            for (direct, filename) in self.dirparseblk(&blkbuf) {
+            for (direct, filename) in direct_parse(&blkbuf) {
                 if filename == name {
                     ret = Some(*direct);
                     found = true;
@@ -1047,15 +1192,24 @@ impl Fs {
         ret
     }
 
-    fn dir_append(&self, buf: &mut [u8], inumber: usize, direct: Direct, name: &[u8]) {
-        let ino = self.dinode(buf, inumber);
-        let nblk = ino.di_size as usize / DEV_BSIZE;
+    fn dir_append(&self, buf: &mut [u8], dinode: &mut Ufs2Dinode, direct: Direct, name: &[u8]) {
+        let mut nblk = howmany(dinode.di_blocks as usize, self.fs_frag as usize) as u64;
+        if nblk == 0 {
+            eprintln!("realloc before={:?}", dinode);
+            // TODO
+            self.dinode_realloc(buf, dinode, 8);
+            eprintln!("realloc after={:?}", dinode);
+            nblk = howmany(dinode.di_blocks as usize, self.fs_frag as usize) as u64;
+        }
+
         assert!(nblk > 0);
 
         let lastblk = nblk - 1;
 
-        let blk = self.blkat_mut(buf, &ino, lastblk);
+        let blk = self.blkat_mut(buf, dinode, lastblk as usize);
         direct_append(blk, direct, name);
+
+        dinode.di_size = nblk * self.fs_bsize as u64;
     }
 
     fn inode_alloc<'a, 'b>(&'a self, buf: &'b mut [u8], dinode: &Ufs2Dinode) -> usize {
@@ -1275,7 +1429,6 @@ use fuser::*;
 
 use libc::ENOENT;
 use std::ffi::OsStr;
-use std::time::{Duration, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
@@ -1435,36 +1588,11 @@ impl<'a> Filesystem for FFS<'a> {
         let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
         info!("dinode_p={:?}", dinode_p);
 
-        let epoch = d.as_secs() as i64;
-        let epoch_ns = d.subsec_nanos() as i32;
+        let mut dinode = Ufs2Dinode::empty(d);
+        dinode.di_mode = mode as u16;
+        dinode.di_nlink = 1;
 
-        let dinode = Ufs2Dinode {
-            di_mode: mode as u16,
-            di_nlink: 1,
-            di_uid: 1, //TODO
-            di_gid: 1, //TODO
-            di_blksize: 0,
-            di_size: 0,
-            di_blocks: 0,
-            di_atime: epoch,
-            di_mtime: epoch,
-            di_ctime: epoch,
-            di_birthtime: epoch,
-            di_mtimensec: epoch_ns,
-            di_atimensec: epoch_ns,
-            di_ctimensec: epoch_ns,
-            di_birthnsec: epoch_ns,
-            di_gen: 0,
-            di_kernflags: 0,
-            di_flags: 0,
-            di_extsize: 0,
-            di_extb: [0i64; NXADDR],
-            di_db: [0i64; NDADDR],
-            di_ib: [0i64; NIADDR],
-            di_spare: [0i64; 3],
-        };
-
-        // allocate inod
+        // allocate ino
         let inumber = self.fs.inode_alloc(self.buf, &dinode);
 
         // update directory
@@ -1476,13 +1604,92 @@ impl<'a> Filesystem for FFS<'a> {
             d_namlen: name.len() as u8,
         };
         self.fs
-            .dir_append(self.buf, inumber_p, direct, name.as_bytes());
+            .dir_append(self.buf, &mut dinode_p, direct, name.as_bytes());
 
-        // update parent inode
+        // update inode
+        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
         {
             dinode_p.di_nlink += 1;
             self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
         }
+
+        let ino = (inumber - 1) as u64;
+        reply.entry(&TTL, &dinode_attr(ino, &dinode), ino);
+    }
+
+    /// Create a directory.
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d,
+            Err(_) => {
+                reply.error(libc::ENOSYS);
+                return;
+            }
+        };
+
+        let inumber_p = (parent + 1) as usize;
+        let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
+        info!("dinode_p={:?}", dinode_p);
+
+        // make child directory
+        // allocate new dinode
+        let mut dinode = Ufs2Dinode::empty(d);
+        dinode.di_mode = IFDIR as u16 | (mode & 0xff) as u16;
+        dinode.di_nlink = 2;
+
+        // allocate ino
+        let inumber = self.fs.inode_alloc(self.buf, &dinode);
+
+        // default directory entry
+        self.fs.dir_append(
+            self.buf,
+            &mut dinode,
+            Direct {
+                d_ino: inumber as u32,
+                d_reclen: 0,
+                d_type: DT_DIR,
+                d_namlen: 1,
+            },
+            ".".as_bytes(),
+        );
+        self.fs.dir_append(
+            self.buf,
+            &mut dinode,
+            Direct {
+                d_ino: inumber_p as u32,
+                d_reclen: 0,
+                d_type: DT_DIR,
+                d_namlen: 2,
+            },
+            "..".as_bytes(),
+        );
+
+        // parent to child
+        let name = name.to_str().unwrap();
+        self.fs.dir_append(
+            self.buf,
+            &mut dinode_p,
+            Direct {
+                d_ino: inumber as u32,
+                d_reclen: 0,
+                d_type: DT_DIR,
+                d_namlen: name.len() as u8,
+            },
+            name.as_bytes(),
+        );
+
+        dinode_p.di_nlink += 1;
+
+        self.fs.dinode_update(self.buf, inumber, &dinode);
+        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
 
         let ino = (inumber - 1) as u64;
         reply.entry(&TTL, &dinode_attr(ino, &dinode), ino);
@@ -1552,7 +1759,7 @@ impl<'a> Filesystem for FFS<'a> {
 
         direct.d_namlen = newname.len() as u8;
         self.fs
-            .dir_append(self.buf, inumber_newp, direct, newname.as_bytes());
+            .dir_append(self.buf, &mut dinode_newp, direct, newname.as_bytes());
 
         dinode_p.di_nlink -= 1;
         dinode_newp.di_nlink += 1;
@@ -1591,7 +1798,7 @@ impl<'a> Filesystem for FFS<'a> {
             d_namlen: newname.len() as u8,
         };
         self.fs
-            .dir_append(self.buf, inumber_p, direct, newname.as_bytes());
+            .dir_append(self.buf, &mut dinode_p, direct, newname.as_bytes());
 
         dinode.di_nlink += 1;
         dinode_p.di_nlink += 1;
