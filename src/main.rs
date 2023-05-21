@@ -223,31 +223,48 @@ struct Cg {
 }
 
 impl Fs {
-    fn cg_inosused_mut<'a, 'b>(&'a self, buf: &'b mut [u8], c: usize) -> &'b mut [u8] {
-        let cgbuf = self.cgbuf_mut(buf, c);
-        let (offset, size) = {
-            let cg: &Cg = unsafe { std::mem::transmute(&cgbuf[0]) };
-            (cg.cg_iusedoff as usize, cg.niblk() as usize / 8)
-        };
-        unsafe { std::slice::from_raw_parts_mut(&mut cgbuf[offset], size) }
-    }
-
-    fn cg_inosused(&self, buf: &[u8], c: usize) -> &[u8] {
+    fn cg_bitmap<'a, 'b, F>(&'a self, buf: &'b [u8], c: usize, f: F) -> &'b [u8]
+    where
+        F: FnOnce(&Cg) -> (usize, usize),
+    {
         let cgbuf = self.cgbuf(buf, c);
-        let cg: &Cg = unsafe { std::mem::transmute(&cgbuf[0]) };
-
-        let offset = cg.cg_iusedoff as usize;
-        let size = cg.niblk() as usize / 8;
+        let cg: &Cg = unsafe { std::mem::transmute(cgbuf.as_ptr()) };
+        let (offset, size) = f(cg);
         unsafe { std::slice::from_raw_parts(&cgbuf[offset], size) }
     }
 
-    fn cg_blksfree(&self, buf: &[u8], c: usize) -> &[u8] {
-        let cgbuf = self.cgbuf(buf, c);
-        let cg: &Cg = unsafe { std::mem::transmute(&cgbuf[0]) };
+    fn cg_bitmap_mut<'a, 'b, F>(&'a self, buf: &'b mut [u8], c: usize, f: F) -> &'b mut [u8]
+    where
+        F: FnOnce(&Cg) -> (usize, usize),
+    {
+        let cgbuf = self.cgbuf_mut(buf, c);
+        let cg: &Cg = unsafe { std::mem::transmute(cgbuf.as_ptr()) };
+        let (offset, size) = f(cg);
+        unsafe { std::slice::from_raw_parts_mut(&mut cgbuf[offset], size) }
+    }
 
-        let offset = cg.cg_freeoff as usize;
-        let size = cg.cg_ndblk as usize / 8;
-        unsafe { std::slice::from_raw_parts(&buf[offset], size) }
+    fn cg_inosused<'a, 'b>(&'a self, buf: &'b [u8], c: usize) -> &'b [u8] {
+        self.cg_bitmap(buf, c, |cg| {
+            (cg.cg_iusedoff as usize, cg.niblk() as usize / 8)
+        })
+    }
+
+    fn cg_inosused_mut<'a, 'b>(&'a self, buf: &'b mut [u8], c: usize) -> &'b mut [u8] {
+        self.cg_bitmap_mut(buf, c, |cg| {
+            (cg.cg_iusedoff as usize, cg.niblk() as usize / 8)
+        })
+    }
+
+    fn cg_blksfree<'a, 'b>(&'a self, buf: &'b [u8], c: usize) -> &'b [u8] {
+        self.cg_bitmap(buf, c, |cg| {
+            (cg.cg_freeoff as usize, cg.cg_ndblk as usize / 8)
+        })
+    }
+
+    fn cg_blksfree_mut<'a, 'b>(&'a self, buf: &'b mut [u8], c: usize) -> &'b mut [u8] {
+        self.cg_bitmap_mut(buf, c, |cg| {
+            (cg.cg_freeoff as usize, cg.cg_ndblk as usize / 8)
+        })
     }
 }
 
@@ -611,10 +628,11 @@ fn direct_append(buf: &mut [u8], direct: Direct, name: &[u8]) {
             continue;
         }
 
-        let sz = directsiz(dp.d_namlen);
-        assert!(sz <= blkdata.len());
         break;
     }
+
+    let sz = directsiz(name.len() as u8);
+    assert!(sz <= blkdata.len());
 
     // write direct
     {
@@ -737,46 +755,6 @@ impl Fs {
         v
     }
 
-    fn read_indir(&self, buf: &[u8], ino: &Ufs2Dinode, blk: i64, depth: usize, out: &mut Vec<u8>) {
-        if blk == 0 {
-            return;
-        }
-
-        if depth == 0 {
-            let remain = ino.di_size as usize - out.len();
-            let read = remain.min(self.fs_bsize as usize);
-            if read != self.fs_bsize as usize {
-                let c = self.dtog(blk);
-                let bno = self.dtogd(blk) as usize;
-
-                let blksfreemap = self.cg_blksfree(buf, c as usize);
-                let bitmap = blksfreemap[bno >> 3];
-
-                info!(
-                    "read_indir: c={}, blk={}/{}/{}, {:08b}, fraglen={}/{}",
-                    c,
-                    blk,
-                    self.blknum(blk),
-                    self.fragnum(blk),
-                    bitmap,
-                    read,
-                    howmany(read, self.fs_fsize as usize)
-                );
-            }
-            out.extend_from_slice(self.blk(buf, blk, read));
-            return;
-        }
-
-        let blks = self.blk_indir(buf, blk as i64);
-        for blk_child in blks {
-            let blk_child = blk_child;
-            if blk_child == 0 {
-                break;
-            }
-            self.read_indir(buf, ino, blk_child, depth - 1, out);
-        }
-    }
-
     fn blkpos<'a>(&'a self, blkno: usize) -> BlkPos {
         if blkno < NDADDR {
             return BlkPos::Direct(blkno as u16);
@@ -867,20 +845,11 @@ impl Fs {
     fn read(&self, buf: &[u8], ino: &Ufs2Dinode) -> Vec<u8> {
         let mut out = Vec::with_capacity(ino.di_size as usize);
 
-        for i in 0..NDADDR {
-            let blk = ino.di_db[i];
-            self.read_indir(buf, ino, blk, 0, &mut out);
-            if out.len() == ino.di_size as usize {
-                break;
-            }
-        }
-
-        for i in 0..NIADDR {
-            let blk = ino.di_ib[i];
-            self.read_indir(buf, ino, blk, i + 1, &mut out);
-            if out.len() == ino.di_size as usize {
-                break;
-            }
+        while out.len() < ino.di_size as usize {
+            let blkno = out.len() / self.fs_bsize as usize;
+            let blk = self.blkat(buf, ino, blkno);
+            let blk = &blk[..blk.len().min(ino.di_size as usize - out.len())];
+            out.extend_from_slice(blk);
         }
 
         assert!(
@@ -897,6 +866,12 @@ impl Fs {
 impl Fs {
     fn v2(&self) -> bool {
         self.fs_magic == FS_UFS2_MAGIC
+    }
+
+    fn blk_alloc<'a, 'b>(&self, buf: &mut [u8]) -> i32 {
+        let c = 0;
+        let blksfreemap = self.cg_blksfree_mut(buf, c);
+        todo!()
     }
 
     fn dinode<'a, 'b>(&self, buf: &[u8], inumber: usize) -> Ufs2Dinode {
@@ -1151,7 +1126,7 @@ fn fsck(buf: &[u8]) {
 
     let fs_v2 = fs.fs_magic == FS_UFS2_MAGIC;
 
-    info!("sb={:?}", fs);
+    info!("sb={:?}, v2={}", fs, fs_v2);
 
     fs.check0();
 
@@ -1242,14 +1217,15 @@ fn fsck(buf: &[u8]) {
             let data = fs.read(buf, &ino);
 
             debug!(
-                "ino={}, nlink={}, ctime={}, mode={:0o}, size={}/{}/{}",
+                "ino={}, nlink={}, ctime={}, mode={:0o}, size={}/{}/{}, {:?}",
                 inumber,
                 ino.di_nlink,
                 ino.di_ctime,
                 mode,
                 ino.di_size,
                 data.len(),
-                lndb
+                lndb,
+                ino
             );
 
             if mode == IFREG {
