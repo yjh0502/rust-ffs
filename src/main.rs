@@ -834,8 +834,13 @@ impl Fs {
         assert!(idx < nindir);
 
         let indir = self.blk0(buf, blk);
-        let s = unsafe { from_raw_parts::<i64>(transmute(indir.as_ptr()), nindir) };
-        s[idx]
+        if self.v2() {
+            let s = unsafe { from_raw_parts::<i64>(transmute(indir.as_ptr()), nindir) };
+            s[idx]
+        } else {
+            let s = unsafe { from_raw_parts::<i32>(transmute(indir.as_ptr()), nindir) };
+            s[idx] as i64
+        }
     }
 
     fn blk_indir_set<'a, 'b>(&'a self, buf: &'b mut [u8], blk: i64, idx: usize, val: i64) {
@@ -951,7 +956,7 @@ impl Fs {
             BlkPos::Indirect3(b0, b1, b2) => {
                 let indir0 = self.blk_indir_at(buf, ino.di_ib[2], b0 as usize);
                 let indir1 = self.blk_indir_at(buf, indir0, b1 as usize);
-                self.blk0(buf, self.blk_indir_at(buf, indir1, b1 as usize))
+                self.blk0(buf, self.blk_indir_at(buf, indir1, b2 as usize))
             }
         }
     }
@@ -1308,8 +1313,8 @@ impl Fs {
 
     fn dir_append(&self, buf: &mut [u8], dinode: &mut Ufs2Dinode, direct: Direct, name: &[u8]) {
         let frag = self.fs_frag as usize;
-        let mut nblk = howmany(dinode.di_blocks as usize, frag) as u64;
         loop {
+            let mut nblk = howmany(dinode.di_blocks as usize, frag) as u64;
             if nblk == 0 {
                 self.dinode_realloc(buf, dinode, frag as i64);
                 nblk = howmany(dinode.di_blocks as usize, frag) as u64;
@@ -1320,6 +1325,7 @@ impl Fs {
             let blk = self.blkat_mut(buf, dinode, lastblk as usize);
             if !direct_append(blk, direct, name) {
                 self.dinode_realloc(buf, dinode, (nblk + 1) as i64 * frag as i64);
+                continue;
             }
 
             dinode.di_size = nblk * self.fs_bsize as u64;
@@ -1484,7 +1490,7 @@ fn fsck(buf: &[u8]) {
             let data = fs.read(buf, &ino);
 
             debug!(
-                "ino={}, nlink={}, ctime={}, mode={:0o}, size={}/{}/{}, {:?}",
+                "ino={}, nlink={}, ctime={}, mode={:0o}, size={}/{}/{}",
                 inumber,
                 ino.di_nlink,
                 ino.di_ctime,
@@ -1492,7 +1498,6 @@ fn fsck(buf: &[u8]) {
                 ino.di_size,
                 data.len(),
                 lndb,
-                ino
             );
 
             if mode == IFREG {
