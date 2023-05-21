@@ -801,32 +801,18 @@ impl Fs {
         cg.clone()
     }
 
-    fn blk0_mut<'a, 'b>(&'a self, buf: &'b mut [u8], blk: i64) -> &'b mut [u8] {
-        // device block number
-        let dbno = self.fsbtodb(blk) as usize;
-        assert_eq!(dbno & (self.fs_frag as usize - 1), 0);
+    fn blk0_range(&self, blk: i64) -> std::ops::Range<usize> {
+        let start = (blk * self.fs_fsize as i64) as usize;
+        let end = ((blk + self.fs_frag as i64) * self.fs_fsize as i64) as usize;
+        start..end
+    }
 
-        let offset = dbno * DEV_BSIZE;
-        assert!(offset + self.fs_bsize as usize <= buf.len());
-        &mut buf[offset..offset + self.fs_bsize as usize]
+    fn blk0_mut<'a, 'b>(&'a self, buf: &'b mut [u8], blk: i64) -> &'b mut [u8] {
+        &mut buf[self.blk0_range(blk)]
     }
 
     fn blk0<'a, 'b>(&'a self, buf: &'b [u8], blk: i64) -> &'b [u8] {
-        // device block number
-        let dbno = self.fsbtodb(blk) as usize;
-        // assert_eq!(dbno & (self.fs_frag as usize - 1), 0);
-
-        let offset = dbno * DEV_BSIZE;
-        assert!(offset + self.fs_bsize as usize <= buf.len());
-        &buf[offset..offset + self.fs_bsize as usize]
-    }
-
-    fn blk<'a, 'b>(&'a self, buf: &'b [u8], blk: i64, len: usize) -> &'b [u8] {
-        assert!(len <= self.fs_bsize as usize, "{}", len);
-        let offset = self.fsbtodb(blk) as usize * DEV_BSIZE;
-        assert!(offset + len <= buf.len());
-
-        &buf[offset..offset + len]
+        &buf[self.blk0_range(blk)]
     }
 
     fn blk_indir_at<'a, 'b>(&'a self, buf: &'b [u8], blk: i64, idx: usize) -> i64 {
@@ -856,28 +842,6 @@ impl Fs {
             let s = unsafe { from_raw_parts_mut::<i32>(transmute(indir.as_ptr()), nindir) };
             s[idx] = val as i32;
         }
-    }
-
-    fn blk_indir<'a, 'b>(&'a self, buf: &'b [u8], blk: i64) -> Vec<i64> {
-        let mut v = Vec::with_capacity(self.fs_nindir as usize);
-        let indir = self.blk0(buf, blk);
-
-        if self.v2() {
-            let s = unsafe {
-                from_raw_parts::<i64>(transmute(indir.as_ptr()), self.fs_nindir as usize)
-            };
-            for i in 0..self.fs_nindir as usize {
-                v.push(s[i]);
-            }
-        } else {
-            let s = unsafe {
-                from_raw_parts::<i32>(transmute(indir.as_ptr()), self.fs_nindir as usize)
-            };
-            for i in 0..self.fs_nindir as usize {
-                v.push(s[i] as i64);
-            }
-        }
-        v
     }
 
     fn blkpos<'a>(&'a self, blkno: usize) -> BlkPos {
