@@ -764,8 +764,29 @@ fn isclr(buf: &[u8], idx: usize) -> bool {
     buf[idx / 8] & (1 << (idx % 8)) == 0
 }
 
-fn direct_append(blkbuf: &mut [u8], direct: Direct, name: &[u8]) -> bool {
-    assert_eq!(direct.d_namlen as usize, name.len());
+// write direct to given buffer
+fn direct_write(buf: &mut [u8], mut direct: Direct, name: &[u8]) {
+    let sz = directsiz(name.len() as u8);
+    assert!(sz <= buf.len(), "{} > {}", sz, buf.len());
+
+    direct.d_namlen = name.len() as u8;
+    direct.d_reclen = buf.len() as u16;
+
+    // write direct
+    let dp: &mut Direct = unsafe { transmute(buf.as_mut_ptr()) };
+    *dp = direct;
+
+    // write name
+    let namebuf: &mut [u8] = unsafe {
+        let buf: *mut u8 = transmute(&mut buf[std::mem::size_of::<Direct>()]);
+        from_raw_parts_mut(buf, direct.d_namlen as usize + 1)
+    };
+    namebuf[0..name.len()].copy_from_slice(name);
+    namebuf[name.len()] = 0;
+}
+
+fn direct_append(blkbuf: &mut [u8], mut direct: Direct, name: &[u8]) -> bool {
+    let sz = directsiz(name.len() as u8);
 
     let mut offset = 0;
     while blkbuf.len() >= offset + directsiz(0) {
@@ -774,30 +795,38 @@ fn direct_append(blkbuf: &mut [u8], direct: Direct, name: &[u8]) -> bool {
             break;
         }
 
-        let sz = directsiz(dp.d_namlen);
-        offset += sz;
+        let dpsz = directsiz(dp.d_namlen);
+
+        // check if fits
+        if dpsz + sz <= dp.d_reclen as usize {
+            let mut dpnambuf = [0u8; DEV_BSIZE];
+            unsafe {
+                let buf: *const u8 = transmute(&blkbuf[offset + std::mem::size_of::<Direct>()]);
+                let src = from_raw_parts(buf, dp.d_namlen as usize);
+                (&mut dpnambuf[..dp.d_namlen as usize]).copy_from_slice(src);
+            };
+
+            let buf = &mut blkbuf[offset..offset + dp.d_reclen as usize];
+            let (buf0, buf1) = buf.split_at_mut(dpsz);
+
+            direct_write(buf0, *dp, &dpnambuf[..dp.d_namlen as usize]);
+            direct_write(buf1, direct, name);
+            return true;
+        }
+
+        offset += dp.d_reclen as usize;
         continue;
     }
 
-    let sz = directsiz(name.len() as u8);
+    // should be block boundary
+    assert!(offset % DEV_BSIZE == 0);
+
     if offset + sz > blkbuf.len() {
         return false;
     }
 
-    // write direct
-    {
-        let dp: &mut Direct = unsafe { transmute(&mut blkbuf[offset]) };
-        *dp = direct;
-    }
-
-    // write name
-    {
-        let namebuf: &mut [u8] = unsafe {
-            let buf: *mut u8 = transmute(&mut blkbuf[offset + std::mem::size_of::<Direct>()]);
-            from_raw_parts_mut(buf, direct.d_namlen as usize)
-        };
-        namebuf.copy_from_slice(name);
-    }
+    let mut buf = &mut blkbuf[offset..offset + DEV_BSIZE];
+    direct_write(buf, direct, name);
 
     true
 }
@@ -1819,7 +1848,7 @@ impl<'a> Filesystem for FFS<'a> {
             d_ino: inumber as u32,
             d_reclen: 0,
             d_type: DT_REG,
-            d_namlen: name.len() as u8,
+            d_namlen: 0,
         };
         self.fs
             .dir_append(self.buf, &mut dinode_p, direct, name.as_bytes());
@@ -1874,7 +1903,7 @@ impl<'a> Filesystem for FFS<'a> {
                 d_ino: inumber as u32,
                 d_reclen: 0,
                 d_type: DT_DIR,
-                d_namlen: 1,
+                d_namlen: 0,
             },
             ".".as_bytes(),
         );
@@ -1885,7 +1914,7 @@ impl<'a> Filesystem for FFS<'a> {
                 d_ino: inumber_p as u32,
                 d_reclen: 0,
                 d_type: DT_DIR,
-                d_namlen: 2,
+                d_namlen: 0,
             },
             "..".as_bytes(),
         );
@@ -1899,7 +1928,7 @@ impl<'a> Filesystem for FFS<'a> {
                 d_ino: inumber as u32,
                 d_reclen: 0,
                 d_type: DT_DIR,
-                d_namlen: name.len() as u8,
+                d_namlen: 0,
             },
             name.as_bytes(),
         );
