@@ -1,4 +1,5 @@
 use anyhow::Result;
+use argh::FromArgs;
 use libc::*;
 use log::*;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2247,13 +2248,42 @@ impl<'a> Filesystem for FFS<'a> {
     }
 }
 
+#[derive(FromArgs)]
+/// Reach new heights.
+struct Args {
+    /// enable read-write with mmap
+    #[argh(switch)]
+    rw: bool,
+
+    /// an optional nickname for the pilot
+    #[argh(option)]
+    image: String,
+}
+
 fn main() -> Result<()> {
+    use memmap2::{MmapMut, MmapOptions};
+    use std::fs::{File, OpenOptions};
+
     env_logger::init();
 
-    let filepath = std::env::args().nth(1).expect("usage: cmd <file>");
-    let mut file = std::fs::read(filepath)?;
+    let args: Args = argh::from_env();
 
-    fsck(&file);
+    let (file, mut map): (File, MmapMut) = unsafe {
+        if args.rw {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&args.image)?;
+            let map = MmapOptions::new().map_mut(&file)?;
+            (file, map)
+        } else {
+            let file = File::open(&args.image)?;
+            let map = MmapOptions::new().map_copy(&file)?;
+            (file, map)
+        }
+    };
+
+    fsck(&map);
 
     let options = vec![
         MountOption::RW,
@@ -2262,10 +2292,10 @@ fn main() -> Result<()> {
         MountOption::FSName("ffs".to_string()),
     ];
 
-    let buf = file.as_mut_slice();
+    let buf: &mut [u8] = &mut map;
     let fs = fs(buf);
     let ffs = FFS { buf, fs };
-    fuser::mount2(ffs, "mnt", &options).unwrap();
+    fuser::mount2(ffs, "mnt", &options)?;
 
     Ok(())
 }
