@@ -1,3 +1,4 @@
 /target
-test.img
-mnt
+/images
+/mnt
+*.img
