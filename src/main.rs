@@ -892,9 +892,13 @@ impl Fs {
         assert_eq!(self.fs_nindir, self.fs_bsize / blkidxsz as i32);
     }
 
-    fn fs_alt(&self, buf: &[u8]) -> Self {
+    fn alt_offset(&self) -> usize {
         let blk_alt = self.cgsblock(self.fs_ncg as i64 - 1);
-        let offset_alt = self.fsbtodb(blk_alt) as usize * DEV_BSIZE;
+        self.fsbtodb(blk_alt) as usize * DEV_BSIZE
+    }
+
+    fn fs_alt(&self, buf: &[u8]) -> Self {
+        let offset_alt = self.alt_offset();
 
         let fs_alt: &Fs = unsafe { transmute(&buf[offset_alt]) };
         fs_alt.clone()
