@@ -895,7 +895,7 @@ fn locate(bitmap: &[u8], frag: u8, allocsiz: u8) -> usize {
     assert!(frag >= allocsiz);
 
     let mut bno = (bitmap.len() - loc) * 8;
-    let mut i = bno + 8;
+    let i = bno + 8;
     while bno < i {
         let blk = (blkmap(bitmap, bno, frag) as u16) << 1;
 
@@ -1099,6 +1099,7 @@ impl Fs {
     }
 
     fn blk_indir_at<'a, 'b>(&'a self, buf: &'b [u8], blk: i64, idx: usize) -> i64 {
+        assert!(blk > 0);
         let nindir = self.fs_nindir as usize;
         assert!(idx < nindir);
 
@@ -1234,21 +1235,24 @@ impl Fs {
         self.fs_magic == FS_UFS2_MAGIC
     }
 
-    fn blk_free<'a, 'b>(&mut self, buf: &mut [u8], blkno: i64, frags: i64) {
-        let c = self.dtog(blkno) as usize;
+    fn blk_free<'a, 'b>(&mut self, buf: &mut [u8], nblk: i64, frags: i64) {
+        let c = self.dtog(nblk) as usize;
 
-        let fragoff = blkno % self.fs_frag as i64;
+        let fragoff = nblk % self.fs_frag as i64;
         let fragrem = self.fs_frag as i64 - fragoff;
         assert!(fragrem >= frags);
         if fragoff == 0 {
             assert_eq!(frags, 8);
         }
 
+        let blk_start = self.cgbase(c as i64);
+
         // clear bitmap
         let map = self.cg_blksfree_mut(buf, c);
-        for blk in blkno..(blkno + frags) {
-            assert!(isclr(map, blk as usize));
-            setbit(map, blk as usize);
+        for blk in nblk..(nblk + frags) {
+            let blkoff = (blk - blk_start) as usize;
+            assert!(isclr(map, blkoff));
+            setbit(map, blkoff);
         }
 
         let cgbuf = self.cgbuf_mut(buf, c);
@@ -1604,7 +1608,7 @@ impl Fs {
         if nblocks > 0 {
             dinode.di_blocks += self.fsbtodb(nblocks * self.fs_frag as i64) as u64;
         } else {
-            dinode.di_blocks -= self.fsbtodb(nblocks * self.fs_frag as i64) as u64;
+            dinode.di_blocks -= self.fsbtodb(-nblocks * self.fs_frag as i64) as u64;
         }
 
         trace!(
