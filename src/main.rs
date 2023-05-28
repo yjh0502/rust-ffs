@@ -682,7 +682,7 @@ impl BlkPos {
             }
             Indirect2(n0, n1) => {
                 if n1 < nindir - 1 {
-                    Indirect2(n0, n1)
+                    Indirect2(n0, n1 + 1)
                 } else {
                     if n0 < nindir - 1 {
                         Indirect2(n0 + 1, 0)
