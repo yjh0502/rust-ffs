@@ -647,6 +647,69 @@ impl Fs {
     fn blknum(&self, fsb: i64) -> i64 {
         fsb & !(self.fs_frag as i64 - 1)
     }
+
+    /*
+     * block operations
+     *
+     * check if a block is available
+     */
+    fn isblock(&self, bitmap: &[u8], blk: usize) -> bool {
+        match self.fs_frag {
+            8 => bitmap[blk] == 0xff,
+            4 => {
+                let mask = 0x0f << ((blk & 0x01) << 2);
+                (bitmap[blk >> 1] & mask) == mask
+            }
+            2 => {
+                let mask = 0x03 << ((blk & 0x03) << 1);
+                (bitmap[blk >> 2] & mask) == mask
+            }
+            1 => {
+                let mask = 0x01 << (blk & 0x07);
+                (bitmap[blk >> 3] & mask) == mask
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /*
+     * take a block out of the map
+     */
+    fn clrblock(&self, bitmap: &mut [u8], blk: usize) {
+        match self.fs_frag {
+            8 => bitmap[blk] = 0,
+            4 => bitmap[blk >> 1] &= !(0x0f << ((blk & 0x01) << 2)),
+            2 => bitmap[blk >> 2] &= !(0x03 << ((blk & 0x03) << 1)),
+            1 => bitmap[blk >> 3] &= !(0x01 << (blk & 0x07)),
+            _ => unreachable!(),
+        }
+    }
+
+    /*
+     * put a block into the map
+     */
+    fn setblock(&self, bitmap: &mut [u8], blk: usize) {
+        match self.fs_frag {
+            8 => bitmap[blk] = 0xff,
+            4 => bitmap[blk >> 1] |= 0x0f << ((blk & 0x01) << 2),
+            2 => bitmap[blk >> 2] |= 0x03 << ((blk & 0x03) << 1),
+            1 => bitmap[blk >> 3] |= 0x01 << (blk & 0x07),
+            _ => unreachable!(),
+        }
+    }
+
+    /*
+     * check if a block is free
+     */
+    fn isfreeblock(&self, bitmap: &[u8], blk: usize) -> bool {
+        match self.fs_frag {
+            8 => bitmap[blk] == 0,
+            4 => (bitmap[blk >> 1] & (0x0f << ((blk & 0x01) << 2))) == 0,
+            2 => (bitmap[blk >> 2] & (0x03 << ((blk & 0x03) << 1))) == 0,
+            1 => (bitmap[blk >> 3] & (0x01 << (blk & 0x07))) == 0,
+            _ => unreachable!(),
+        }
+    }
 }
 
 fn howmany(a: usize, b: usize) -> usize {
@@ -1107,47 +1170,54 @@ impl Fs {
         self.fs_cstotal.cs_nbfree += 1;
     }
 
+    fn blk_alloc_cg<'a, 'b>(&mut self, buf: &mut [u8], nblk: i64, c: usize) -> Option<i64> {
+        assert!(nblk <= self.fs_frag as i64);
+
+        let cgbuf = self.cgbuf(buf, c);
+        let cg: &Cg = unsafe { transmute(cgbuf.as_ptr()) };
+        if cg.cg_cs.cs_nbfree == 0 {
+            return None;
+        }
+
+        let blksfreemap = self.cg_blksfree_mut(buf, c);
+
+        let blk_start = self.fragstoblks(self.cgbase(c as i64));
+        let blk_end = self.fragstoblks(self.cgbase(c as i64 + 1));
+
+        for blk in blk_start..blk_end {
+            let blkoff = (blk - blk_start) as usize;
+            let blkno = self.blkstofrags(blk);
+
+            if blkno < self.cgdata(c as i64) {
+                continue;
+            }
+            if !self.isblock(blksfreemap, blkoff) {
+                continue;
+            }
+
+            self.clrblock(blksfreemap, blkoff);
+
+            let blkbuf = self.blk0_mut(buf, blkno);
+            blkbuf.fill(0);
+
+            let cgbuf = self.cgbuf_mut(buf, c);
+            let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
+
+            cg.cg_cs.cs_nbfree -= 1;
+            self.fs_ffs1_cstotal.cs_nbfree -= 1;
+            self.fs_cstotal.cs_nbfree -= 1;
+
+            return Some(blkno);
+        }
+        None
+    }
+
     // allocate whole block
     fn blk_alloc<'a, 'b>(&mut self, buf: &mut [u8], nblk: i64) -> i64 {
         assert_eq!(nblk, self.fs_frag as i64);
 
         for c in 0..self.fs_ncg as usize {
-            let blksfreemap = self.cg_blksfree_mut(buf, c);
-
-            let blk_start = self.fragstoblks(c as i64 * self.fs_fpg as i64);
-            let blk_end = self.fragstoblks((c + 1) as i64 * self.fs_fpg as i64);
-
-            for blk in blk_start..blk_end {
-                let blkno = self.blkstofrags(blk);
-                let mut filled = false;
-                for i in 0..self.fs_frag as i64 {
-                    let idx = self.dtogd(blkno + i) as usize;
-
-                    if isclr(blksfreemap, idx) {
-                        filled = true;
-                        break;
-                    }
-                }
-
-                if filled {
-                    continue;
-                }
-
-                for i in 0..self.fs_frag as i64 {
-                    let idx = self.dtogd(blkno + i) as usize;
-                    clrbit(blksfreemap, idx);
-                }
-
-                let blkbuf = self.blk0_mut(buf, blkno);
-                blkbuf.fill(0);
-
-                let cgbuf = self.cgbuf_mut(buf, c);
-                let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
-
-                cg.cg_cs.cs_nbfree -= 1;
-                self.fs_ffs1_cstotal.cs_nbfree -= 1;
-                self.fs_cstotal.cs_nbfree -= 1;
-
+            if let Some(blkno) = self.blk_alloc_cg(buf, nblk, c) {
                 return blkno;
             }
         }
