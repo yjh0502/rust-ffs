@@ -613,12 +613,15 @@ impl Fs {
         loc & self.fs_qfmask
     }
 
-    /*
-    #define lblktosize(fs, blk)	/* calculates ((off_t)blk * fs->fs_bsize) */ \
-        ((off_t)(blk) << (fs)->fs_bshift)
-    #define lblkno(fs, loc)		/* calculates (loc / fs->fs_bsize) */ \
-        ((loc) >> (fs)->fs_bshift)
-    */
+    /* calculates ((off_t)blk * fs->fs_bsize) */
+    fn lblktosize(&self, blk: i64) -> i64 {
+        blk << self.fs_bshift
+    }
+
+    /* calculates (loc / fs->fs_bsize) */
+    fn lblkno(&self, loc: i64) -> i64 {
+        loc >> self.fs_bshift
+    }
 
     /* calculates (loc / fs->fs_fsize) */
     fn numfrags(&self, loc: i64) -> i64 {
@@ -649,6 +652,25 @@ impl Fs {
     fn blknum(&self, fsb: i64) -> i64 {
         fsb & !(self.fs_frag as i64 - 1)
     }
+
+    /*
+     * Determining the size of a file block in the file system.
+     */
+    /*
+    #define blksize(fs, ip, lbn) \
+        (((lbn) >= NDADDR || DIP((ip), size) >= ((lbn) + 1) << (fs)->fs_bshift) \
+            ? (u_int64_t)(fs)->fs_bsize \
+            : (fragroundup(fs, blkoff(fs, DIP((ip), size)))))
+    #define dblksize(fs, dip, lbn) \
+        (((lbn) >= NDADDR || (dip)->di_size >= ((lbn) + 1) << (fs)->fs_bshift) \
+            ? (u_int64_t)(fs)->fs_bsize \
+            : (fragroundup(fs, blkoff(fs, (dip)->di_size))))
+
+    #define sblksize(fs, size, lbn) \
+            (((lbn) >= NDADDR || (size) >= ((lbn) + 1) << (fs)->fs_bshift) \
+                ? (u_int64_t)(fs)->fs_bsize \
+                : (fragroundup(fs, blkoff(fs, (size)))))
+        */
 
     /*
      * block operations
@@ -712,6 +734,12 @@ impl Fs {
             _ => unreachable!(),
         }
     }
+}
+
+macro_rules! howmany {
+    ($a:expr, $b:expr) => {
+        ($a + $b - 1) / $b
+    };
 }
 
 fn howmany(a: usize, b: usize) -> usize {
