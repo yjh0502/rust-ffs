@@ -785,7 +785,13 @@ fn direct_write(buf: &mut [u8], mut direct: Direct, name: &[u8]) {
     namebuf[name.len()] = 0;
 }
 
-fn direct_append(blkbuf: &mut [u8], mut direct: Direct, name: &[u8]) -> bool {
+enum AppendResult {
+    InPlace,
+    NewBlock(usize),
+    Failed,
+}
+
+fn direct_append(blkbuf: &mut [u8], direct: Direct, name: &[u8]) -> AppendResult {
     let sz = directsiz(name.len() as u8);
 
     let mut offset = 0;
@@ -811,7 +817,7 @@ fn direct_append(blkbuf: &mut [u8], mut direct: Direct, name: &[u8]) -> bool {
 
             direct_write(buf0, *dp, &dpnambuf[..dp.d_namlen as usize]);
             direct_write(buf1, direct, name);
-            return true;
+            return AppendResult::InPlace;
         }
 
         offset += dp.d_reclen as usize;
@@ -822,13 +828,13 @@ fn direct_append(blkbuf: &mut [u8], mut direct: Direct, name: &[u8]) -> bool {
     assert!(offset % DEV_BSIZE == 0);
 
     if offset + sz > blkbuf.len() {
-        return false;
+        return AppendResult::Failed;
     }
 
-    let mut buf = &mut blkbuf[offset..offset + DEV_BSIZE];
+    let buf = &mut blkbuf[offset..offset + DEV_BSIZE];
     direct_write(buf, direct, name);
 
-    true
+    AppendResult::NewBlock(offset)
 }
 
 fn direct_parse(blk: &[u8]) -> Vec<(&Direct, &str)> {
@@ -1448,6 +1454,8 @@ impl Fs {
 
     fn dir_append(&self, buf: &mut [u8], dinode: &mut Ufs2Dinode, direct: Direct, name: &[u8]) {
         let frag = self.fs_frag as usize;
+        use AppendResult::*;
+
         loop {
             let mut nblk = howmany(dinode.di_blocks as usize, frag) as u64;
             if nblk == 0 {
@@ -1458,13 +1466,18 @@ impl Fs {
 
             let lastblk = nblk - 1;
             let blk = self.blkat_mut(buf, dinode, lastblk as usize);
-            if !direct_append(blk, direct, name) {
-                self.dinode_realloc(buf, dinode, (nblk + 1) as i64 * frag as i64);
-                continue;
+            match direct_append(blk, direct, name) {
+                InPlace => return,
+                Failed => {
+                    self.dinode_realloc(buf, dinode, nblk as i64 + 1);
+                    continue;
+                }
+                NewBlock(offset) => {
+                    eprintln!("newblock lastblk={}, offset={}", lastblk, offset);
+                    dinode.di_size = lastblk * self.fs_bsize as u64 + (offset + DEV_BSIZE) as u64;
+                    return;
+                }
             }
-
-            dinode.di_size = nblk * self.fs_bsize as u64;
-            break;
         }
     }
 
