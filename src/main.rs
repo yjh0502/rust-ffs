@@ -1024,7 +1024,7 @@ impl Fs {
             BlkPos::Indirect3(b0, b1, b2) => {
                 let indir0 = self.blk_indir_at(buf, ino.di_ib[2], b0 as usize);
                 let indir1 = self.blk_indir_at(buf, indir0, b1 as usize);
-                self.blk0_mut(buf, self.blk_indir_at(buf, indir1, b1 as usize))
+                self.blk0_mut(buf, self.blk_indir_at(buf, indir1, b2 as usize))
             }
         }
     }
