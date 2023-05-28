@@ -8,6 +8,8 @@ use std::{
     slice::{from_raw_parts, from_raw_parts_mut},
 };
 
+mod tables;
+
 // dinode.h
 /* File permissions. */
 const IEXEC: usize = 0o000100; /* Executable. */
@@ -825,6 +827,65 @@ fn isset(buf: &[u8], idx: usize) -> bool {
 }
 fn isclr(buf: &[u8], idx: usize) -> bool {
     buf[idx / 8] & (1 << (idx % 8)) == 0
+}
+
+fn scan(bitmap: &[u8], frag: u8, allocsiz: u8) -> usize {
+    let table = match frag {
+        8 => &tables::FRAGTBL8[..],
+        1 | 2 | 4 => &tables::FRAGTBL124[..],
+        _ => unimplemented!(),
+    };
+    let mask = 1 << (allocsiz - 1 + (frag % 8));
+
+    for i in 0..bitmap.len() {
+        if table[bitmap[i] as usize] & mask != 0 {
+            return bitmap.len() - i;
+        }
+    }
+    0
+}
+/*
+ * Extract the bits for a block from a map.
+ * Compute the cylinder and rotational position of a cyl block addr.
+ */
+fn blkmap(map: &[u8], loc: usize, frag: u8) -> u8 {
+    (map[loc / 8] >> (loc % 8)) & (0xff >> (8 - frag))
+}
+/*
+#define cbtocylno(fs, bno) \
+    (fsbtodb(fs, bno) / (fs)->fs_spc)
+#define cbtorpos(fs, bno) \
+    ((fs)->fs_nrpos <= 1 ? 0 : \
+     (fsbtodb(fs, bno) % (fs)->fs_spc / (fs)->fs_nsect * (fs)->fs_trackskew + \
+     fsbtodb(fs, bno) % (fs)->fs_spc % (fs)->fs_nsect * (fs)->fs_interleave) % \
+     (fs)->fs_nsect * (fs)->fs_nrpos / (fs)->fs_npsect)
+*/
+
+fn locate(bitmap: &[u8], frag: u8, allocsiz: u8) -> usize {
+    let loc = scan(bitmap, frag, allocsiz);
+    assert!(loc > 0);
+    assert!(frag >= allocsiz);
+
+    let mut bno = (bitmap.len() - loc) * 8;
+    let mut i = bno + 8;
+    while bno < i {
+        let blk = (blkmap(bitmap, bno, frag) as u16) << 1;
+
+        let mut field = tables::AROUND[allocsiz as usize];
+        let mut subfield = tables::INSIDE[allocsiz as usize];
+
+        for pos in 0..=(frag - allocsiz) {
+            if (blk & field) == subfield {
+                return bno + pos as usize;
+            }
+            field <<= 1;
+            subfield <<= 1;
+        }
+
+        bno += frag as usize;
+    }
+
+    todo!();
 }
 
 // write direct to given buffer
@@ -2576,5 +2637,31 @@ mod tests {
     fn inode_test() {
         assert_eq!(std::mem::size_of::<Ufs1Dinode>(), 128);
         assert_eq!(std::mem::size_of::<Ufs2Dinode>(), 256);
+    }
+
+    #[test]
+    fn scan_test() {
+        assert_eq!(scan(&[0x00, 0x00, 0x00, 0x00], 8, 8), 0);
+
+        assert_eq!(scan(&[0xff, 0xff, 0xff, 0xff], 8, 8), 4);
+        assert_eq!(scan(&[0xfe, 0xff, 0xff, 0xff], 8, 8), 3);
+        assert_eq!(scan(&[0xfe, 0xff, 0xff, 0xff], 8, 7), 4);
+
+        assert_eq!(scan(&[0xfe, 0xff, 0xff, 0xff], 4, 4), 4);
+
+        assert_eq!(scan(&[0x01, 0xff, 0xff, 0xff], 1, 1), 4);
+        assert_eq!(scan(&[0x00, 0x00, 0x00, 0x01], 1, 1), 1);
+    }
+
+    #[test]
+    fn locate_test() {
+        assert_eq!(locate(&[0xff, 0xff, 0xff, 0xff], 8, 8), 0);
+        assert_eq!(locate(&[0xfe, 0xff, 0xff, 0xff], 8, 8), 8);
+
+        assert_eq!(locate(&[0xfe, 0xff, 0xff, 0xff], 8, 7), 1);
+        assert_eq!(locate(&[0x7f, 0xff, 0xff, 0xff], 8, 7), 0);
+
+        assert_eq!(locate(&[0x00, 0x01, 0xff, 0xff], 1, 1), 8);
+        assert_eq!(locate(&[0x00, 0x80, 0xff, 0xff], 1, 1), 15);
     }
 }
