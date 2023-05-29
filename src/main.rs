@@ -844,6 +844,14 @@ impl BlkPos {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BlkRef {
+    /// direct reference embedded on dinode
+    Direct(u16),
+    /// indirect reference with blk/idx
+    Indirect(i64, u16),
+}
+
 fn setbit(buf: &mut [u8], idx: usize) {
     buf[idx / 8] |= 1 << (idx % 8);
 }
@@ -1168,45 +1176,41 @@ impl Fs {
         ino: &'c Ufs2Dinode,
         blkno: usize,
     ) -> &'b mut [u8] {
-        match self.blkpos(blkno) {
-            BlkPos::Direct(blkno) => {
-                let blk = ino.di_db[blkno as usize];
-                self.blk0_mut(buf, blk)
+        let pos = self.blkpos(blkno);
+        let blk = self.indirat(buf, ino, pos);
+        self.blk0_mut(buf, blk)
+    }
+
+    fn blkat<'a, 'b, 'c>(&'a self, buf: &'b [u8], ino: &'c Ufs2Dinode, blkno: usize) -> &'b [u8] {
+        let pos = self.blkpos(blkno);
+        let blk = self.indirat(buf, ino, pos);
+        self.blk0(buf, blk)
+    }
+
+    fn indirat0(&self, buf: &[u8], dinode: &Ufs2Dinode, pos: BlkPos) -> BlkRef {
+        use BlkPos::*;
+        match pos {
+            Direct(n) => BlkRef::Direct(n),
+            Indirect1(n) => BlkRef::Indirect(dinode.di_ib[0], n),
+            Indirect2(n0, n1) => {
+                let blkno0 = self.blk_indir_at(buf, dinode.di_ib[1], n0 as usize);
+                BlkRef::Indirect(blkno0, n1)
             }
-            BlkPos::Indirect1(b0) => {
-                self.blk0_mut(buf, self.blk_indir_at(buf, ino.di_ib[0], b0 as usize))
-            }
-            BlkPos::Indirect2(b0, b1) => {
-                let indir0 = self.blk_indir_at(buf, ino.di_ib[1], b0 as usize);
-                self.blk0_mut(buf, self.blk_indir_at(buf, indir0, b1 as usize))
-            }
-            BlkPos::Indirect3(b0, b1, b2) => {
-                let indir0 = self.blk_indir_at(buf, ino.di_ib[2], b0 as usize);
-                let indir1 = self.blk_indir_at(buf, indir0, b1 as usize);
-                self.blk0_mut(buf, self.blk_indir_at(buf, indir1, b2 as usize))
+            Indirect3(n0, n1, n2) => {
+                let blkno0 = self.blk_indir_at(buf, dinode.di_ib[2], n0 as usize);
+                let blkno1 = self.blk_indir_at(buf, blkno0, n1 as usize);
+                BlkRef::Indirect(blkno1, n2)
             }
         }
     }
 
-    fn blkat<'a, 'b>(&'a self, buf: &'a [u8], ino: &'b Ufs2Dinode, blkno: usize) -> &'a [u8] {
-        match self.blkpos(blkno) {
-            BlkPos::Direct(blkno) => {
-                let blk = ino.di_db[blkno as usize];
-                self.blk0(buf, blk)
-            }
-            BlkPos::Indirect1(b0) => {
-                self.blk0(buf, self.blk_indir_at(buf, ino.di_ib[0], b0 as usize))
-            }
-            BlkPos::Indirect2(b0, b1) => {
-                let indir0 = self.blk_indir_at(buf, ino.di_ib[1], b0 as usize);
-                self.blk0(buf, self.blk_indir_at(buf, indir0, b1 as usize))
-            }
-            BlkPos::Indirect3(b0, b1, b2) => {
-                let indir0 = self.blk_indir_at(buf, ino.di_ib[2], b0 as usize);
-                let indir1 = self.blk_indir_at(buf, indir0, b1 as usize);
-                self.blk0(buf, self.blk_indir_at(buf, indir1, b2 as usize))
-            }
-        }
+    fn indirat(&self, buf: &[u8], dinode: &Ufs2Dinode, pos: BlkPos) -> i64 {
+        let blk = match self.indirat0(buf, dinode, pos) {
+            BlkRef::Direct(n) => dinode.di_db[n as usize],
+            BlkRef::Indirect(blkno, idx) => self.blk_indir_at(buf, blkno, idx as usize),
+        };
+        assert!(blk > 0);
+        blk
     }
 
     fn read(&self, buf: &[u8], ino: &Ufs2Dinode) -> Vec<u8> {
