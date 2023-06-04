@@ -1896,8 +1896,6 @@ impl Fs {
 
             assert!(nblk > 0);
 
-            let fragnum = self.fragnum(fsb);
-
             let lastblk = nblk - 1;
             let blkbuf = self.blkat_mut(buf, dinode, lastblk as usize);
 
@@ -1946,19 +1944,6 @@ impl Fs {
         }
         panic!("out of inodes");
     }
-}
-
-#[repr(C)]
-struct Bufarea {
-    b_bno: usize,
-    b_next: usize,
-    b_prev: usize,
-    b_size: u32,
-    b_errs: u32,
-    b_flags: u32,
-
-    b_un: usize,
-    b_dirty: usize,
 }
 
 fn fs(buf: &[u8]) -> (usize, Fs) {
@@ -2817,19 +2802,6 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use memoffset::offset_of;
-
-    #[test]
-    fn bufarea_test() {
-        assert_eq!(offset_of!(Bufarea, b_bno), 0);
-        assert_eq!(offset_of!(Bufarea, b_next), 8);
-        assert_eq!(offset_of!(Bufarea, b_prev), 16);
-        assert_eq!(offset_of!(Bufarea, b_size), 24);
-        assert_eq!(offset_of!(Bufarea, b_errs), 28);
-        assert_eq!(offset_of!(Bufarea, b_flags), 32);
-        assert_eq!(offset_of!(Bufarea, b_dirty), 48);
-
-        assert_eq!(std::mem::size_of::<Bufarea>(), 56);
-    }
 
     #[test]
     fn fs_test() {
