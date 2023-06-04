@@ -1349,6 +1349,7 @@ impl Fs {
         None
     }
 
+    // allocate whole block
     fn blk_alloc_full<'a, 'b>(&mut self, buf: &mut [u8]) -> FragIdx {
         for c in 0..self.fs_ncg {
             let c = CgIdx(c as i64);
@@ -1359,7 +1360,6 @@ impl Fs {
         todo!("blk_alloc_full");
     }
 
-    // allocate whole block
     fn blk_alloc<'a, 'b>(&mut self, buf: &mut [u8], nblk: i64) -> FragIdx {
         let blkno = self.blk_alloc_full(buf);
 
@@ -1672,17 +1672,39 @@ impl Fs {
 
                     blk
                 } else if frags_prev < frags_next {
-                    let blk_next = self.blk_alloc(buf, frags_next);
+                    // try to realloc in-place
+                    let c = self.dtog(blk);
+                    let blk_start = self.cgbase(c);
+                    let map = self.cg_blksfree_mut(buf, c);
+                    let mut inplace = true;
+                    for f in frags_prev..=frags_next {
+                        let blkoff = (blk.0 - blk_start.0 + f) as usize;
+                        if isclr(map, blkoff) {
+                            inplace = false;
+                            break;
+                        }
+                    }
 
-                    let blkbuf = self.blk0(buf, blk).to_vec();
-                    let blkbuf_next = self.blk0_mut(buf, blk_next);
-                    (&mut blkbuf_next[..blkbuf.len()]).copy_from_slice(&blkbuf[..]);
+                    if inplace {
+                        for f in frags_prev..=frags_next {
+                            let blkoff = (blk.0 - blk_start.0 + f) as usize;
+                            clrbit(map, blkoff);
+                        }
 
-                    (&mut buf[osize as usize..nsize as usize]).fill(0);
+                        blk
+                    } else {
+                        let blk_next = self.blk_alloc(buf, frags_next);
 
-                    self.blk_free(buf, blk, frags_prev);
+                        let blkbuf = self.blk0(buf, blk).to_vec();
+                        let blkbuf_next = self.blk0_mut(buf, blk_next);
+                        (&mut blkbuf_next[..blkbuf.len()]).copy_from_slice(&blkbuf[..]);
 
-                    blk_next
+                        (&mut buf[osize as usize..nsize as usize]).fill(0);
+
+                        self.blk_free(buf, blk, frags_prev);
+
+                        blk_next
+                    }
                 } else {
                     // shirink
                     // handle bitmap
