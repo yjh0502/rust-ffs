@@ -698,7 +698,8 @@ impl Fs {
      *
      * check if a block is available
      */
-    fn isblock(&self, bitmap: &[u8], blk: usize) -> bool {
+    fn isblock(&self, bitmap: &[u8], blk: BlkIdx) -> bool {
+        let blk = blk.0 as usize;
         match self.fs_frag {
             8 => bitmap[blk] == 0xff,
             4 => {
@@ -720,7 +721,8 @@ impl Fs {
     /*
      * take a block out of the map
      */
-    fn clrblock(&self, bitmap: &mut [u8], blk: usize) {
+    fn clrblock(&self, bitmap: &mut [u8], blk: BlkIdx) {
+        let blk = blk.0 as usize;
         match self.fs_frag {
             8 => bitmap[blk] = 0,
             4 => bitmap[blk >> 1] &= !(0x0f << ((blk & 0x01) << 2)),
@@ -1299,12 +1301,49 @@ impl Fs {
             setbit(map, blkoff);
         }
 
+        // accounting
+        let mut frag_before = 0;
+        let mut i = fsb.0 - 1;
+        while i >= self.blknum(fsb).0 {
+            let blkoff = (i - blk_start.0) as usize;
+            if isset(map, blkoff) {
+                break;
+            }
+
+            i -= 1;
+            frag_before += 1;
+        }
+
+        let mut frag_after = 0;
+        let mut i = fsb.0 + frags;
+        while i < self.blknum(FragIdx(fsb.0 + 1)).0 {
+            let blkoff = (i - blk_start.0) as usize;
+            if isset(map, blkoff) {
+                break;
+            }
+
+            i += 1;
+            frag_after += 1;
+        }
+
+        // accounting
         let cgbuf = self.cgbuf_mut(buf, c);
         let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
 
-        cg.cg_cs.cs_nbfree += 1;
-        self.fs_ffs1_cstotal.cs_nbfree += 1;
-        self.fs_cstotal.cs_nbfree += 1;
+        if frag_before > 0 {
+            cg.cg_frsum[frag_before] -= 1;
+        }
+        if frag_after > 0 {
+            cg.cg_frsum[frag_after] -= 1;
+        }
+        let frag_new = frag_before + frag_after + frags as usize;
+        if frag_new == self.fs_frag as usize {
+            cg.cg_cs.cs_nbfree += 1;
+            self.fs_ffs1_cstotal.cs_nbfree += 1;
+            self.fs_cstotal.cs_nbfree += 1;
+        } else {
+            cg.cg_frsum[frag_new] += 1;
+        }
     }
 
     fn blk_alloc_cg<'a, 'b>(&mut self, buf: &mut [u8], nblk: i64, c: CgIdx) -> Option<FragIdx> {
@@ -1316,23 +1355,23 @@ impl Fs {
             return None;
         }
 
-        let blksfreemap = self.cg_blksfree_mut(buf, c);
+        let map = self.cg_blksfree_mut(buf, c);
 
         let blk_start = self.fragstoblks(self.cgbase(c));
         let blk_end = self.fragstoblks(self.cgbase(CgIdx(c.0 + 1)));
 
         for blk in blk_start.0..blk_end.0 {
-            let blkoff = (blk - blk_start.0) as usize;
+            let blkoff = BlkIdx(blk - blk_start.0);
             let blkno = self.blkstofrags(BlkIdx(blk));
 
             if blkno < self.cgdata(c) {
                 continue;
             }
-            if !self.isblock(blksfreemap, blkoff) {
+            if !self.isblock(map, blkoff) {
                 continue;
             }
 
-            self.clrblock(blksfreemap, blkoff);
+            self.clrblock(map, blkoff);
 
             let blkbuf = self.blk0_mut(buf, blkno);
             blkbuf.fill(0);
@@ -1373,6 +1412,10 @@ impl Fs {
             assert!(isclr(map, blkoff));
             setbit(map, blkoff);
         }
+
+        let cgbuf = self.cgbuf_mut(buf, c);
+        let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
+        cg.cg_frsum[self.fs_frag as usize - nblk as usize] += 1;
 
         blkno
     }
@@ -1417,6 +1460,7 @@ impl Fs {
 
     fn dinode_free<'a, 'b>(&mut self, buf: &mut [u8], inumber: usize, mut dinode: Ufs2Dinode) {
         self.dinode_realloc(buf, &mut dinode, 0);
+        assert_eq!(dinode.di_blocks, 0);
 
         dinode.di_size = 0;
         assert_eq!(dinode.di_blocks, 0);
@@ -1677,7 +1721,7 @@ impl Fs {
                     let blk_start = self.cgbase(c);
                     let map = self.cg_blksfree_mut(buf, c);
                     let mut inplace = true;
-                    for f in frags_prev..=frags_next {
+                    for f in frags_prev..frags_next {
                         let blkoff = (blk.0 - blk_start.0 + f) as usize;
                         if isclr(map, blkoff) {
                             inplace = false;
@@ -1686,7 +1730,8 @@ impl Fs {
                     }
 
                     if inplace {
-                        for f in frags_prev..=frags_next {
+                        // TODO: fragment accounting
+                        for f in frags_prev..frags_next {
                             let blkoff = (blk.0 - blk_start.0 + f) as usize;
                             clrbit(map, blkoff);
                         }
@@ -1709,15 +1754,16 @@ impl Fs {
                     // shirink
                     // handle bitmap
                     let c = self.dtog(blk);
-                    let map = self.cg_inosused_mut(buf, c);
+                    let map = self.cg_blksfree_mut(buf, c);
 
                     let blk_start = self.cgbase(c);
                     for i in frags_next..frags_prev {
-                        // TODO: TYPE
                         let blkoff = (blk.0 - blk_start.0 + i) as usize;
                         assert!(isclr(map, blkoff));
                         setbit(map, blkoff);
                     }
+
+                    // TODO: fragment accounting
 
                     blk
                 }
