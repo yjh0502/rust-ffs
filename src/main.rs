@@ -1132,24 +1132,33 @@ impl Fs {
         self.indirat1(buf, dinode, r)
     }
 
-    fn inobuf<'a, 'b, 'c>(
+    fn inobuf_mut<'a, 'b, 'c>(
         &'a self,
-        buf: &'b [u8],
+        buf: &'b mut [u8],
         ino: &'c Ufs2Dinode,
         offset: i64,
         len: i64,
-    ) -> &'b [u8] {
-        assert!(offset >= 0 && len >= 0);
+    ) -> &'b mut [u8] {
+        assert!(offset >= 0 && len > 0);
 
         let blkno = self.lblkno(offset);
-        let blkno_end = self.lblkno(offset + len);
-        assert_eq!(blkno, blkno_end);
+        let blkno_end = self.lblkno(offset + len - 1);
+        assert_eq!(
+            blkno, blkno_end,
+            "inobuf_mut: not in one block: {} {}",
+            offset, len
+        );
 
         let blkpos = self.blkpos(blkno as usize);
         let fsb = self.indirat(buf, ino, blkpos);
-        let blkbuf = self.blk0(buf, fsb);
+        let blkbuf = self.blk0_mut(buf, fsb);
 
-        &blkbuf[self.blkoff(offset) as usize..self.blkoff(offset + len) as usize]
+        let offset_end = match self.blkoff(offset + len) {
+            0 => self.fs_bsize as usize,
+            x => x as usize,
+        };
+
+        &mut blkbuf[self.blkoff(offset) as usize..offset_end]
     }
 
     fn read(&self, buf: &[u8], ino: &Ufs2Dinode) -> Vec<u8> {
@@ -1837,11 +1846,10 @@ impl Fs {
         let mut read = 0;
         while read < dinode.di_size as usize {
             let blkno = read / self.fs_bsize as usize;
-
-            let blkbuf = self.blkat(buf, &dinode, blkno);
             let remain = (dinode.di_size as usize - read).min(self.fs_bsize as usize);
+            let blkbuf = &self.blkat(buf, &dinode, blkno)[..remain];
 
-            let dirs = direct_parse(&blkbuf[..remain]);
+            let dirs = direct_parse(blkbuf);
             out.extend(dirs);
             read += blkbuf.len();
         }
@@ -1857,10 +1865,10 @@ impl Fs {
         let mut read = 0;
         while read < dinode.di_size as usize {
             let blkno = read / self.fs_bsize as usize;
-            let blkbuf = self.blkat(buf, &dinode, blkno);
             let remain = (dinode.di_size as usize - read).min(self.fs_bsize as usize);
+            let blkbuf = &self.blkat(buf, &dinode, blkno)[..remain];
 
-            for (direct, filename) in direct_parse(&blkbuf[..remain]) {
+            for (direct, filename) in direct_parse(blkbuf) {
                 if filename == name {
                     return Some(*direct);
                 }
@@ -1879,14 +1887,17 @@ impl Fs {
         let mut ret = None;
         let mut blkbuf_out = Vec::with_capacity(self.fs_bsize as usize);
         blkbuf_out.resize(self.fs_bsize as usize, 0);
+        direct_init(&mut blkbuf_out);
 
         let mut read = 0;
         while read < dinode_p.di_size as usize {
             let blkno = read / self.fs_bsize as usize;
-            let blkbuf = self.blkat_mut(buf, &dinode_p, blkno);
+            let remain = (dinode_p.di_size as usize - read).min(self.fs_bsize as usize);
+            let blkbuf = &mut self.blkat_mut(buf, &dinode_p, blkno)[..remain];
+
             read += blkbuf.len();
 
-            let found = direct_parse(&blkbuf)
+            let found = direct_parse(blkbuf)
                 .into_iter()
                 .find(|(_direct, filename)| *filename == name)
                 .is_some();
@@ -1896,7 +1907,7 @@ impl Fs {
             }
 
             let mut found = false;
-            for (direct, filename) in direct_parse(&blkbuf) {
+            for (direct, filename) in direct_parse(blkbuf) {
                 if filename == name {
                     ret = Some(*direct);
                     found = true;
@@ -1906,7 +1917,7 @@ impl Fs {
             }
 
             assert!(found);
-            blkbuf.copy_from_slice(&blkbuf_out);
+            blkbuf.copy_from_slice(&blkbuf_out[..remain]);
             break;
         }
 
@@ -1928,6 +1939,8 @@ impl Fs {
             );
             if dinode.di_blocks == 0 {
                 self.dinode_realloc(buf, dinode, DEV_BSIZE as i64);
+                let mut blkbuf = self.inobuf_mut(buf, dinode, 0, DEV_BSIZE as i64);
+                direct_init(&mut blkbuf);
                 continue;
             }
 
@@ -1945,13 +1958,14 @@ impl Fs {
             match direct_append(devbuf, direct, name) {
                 InPlace(_) => return,
                 Failed => {
-                    let size_next = dinode.di_size + DEV_BSIZE as u64;
+                    let size_prev = dinode.di_size;
+                    let size_next = size_prev + DEV_BSIZE as u64;
                     self.dinode_realloc(buf, dinode, size_next as i64);
+
+                    let mut blkbuf =
+                        self.inobuf_mut(buf, dinode, size_prev as i64, DEV_BSIZE as i64);
+                    direct_init(&mut blkbuf);
                     continue;
-                }
-                NewBlock(offset) => {
-                    trace!("newblock lastblk={}, offset={}", lastblk, offset);
-                    return;
                 }
             }
         }
