@@ -2659,6 +2659,15 @@ impl<'a> Filesystem for FFS<'a> {
             reply.error(ENOENT);
             return;
         }
+        if dinode.mode(IFDIR) {
+            reply.error(EISDIR);
+            return;
+        }
+
+        if offset >= dinode.di_size as i64 {
+            reply.data(&[]);
+            return;
+        }
 
         let data = self.fs.read(self.buf, &dinode);
         let size = std::cmp::min(size as usize, data.len() - offset as usize);
