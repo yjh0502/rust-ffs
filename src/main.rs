@@ -1175,6 +1175,25 @@ impl Fs {
         self.fs_magic == FS_UFS2_MAGIC
     }
 
+    fn freefragsz(&self, buf: &[u8], fsb: FragIdx) -> usize {
+        let c = self.dtog(fsb);
+        let blk_start = self.cgbase(c);
+        let map = self.cg_blksfree(buf, c);
+
+        let mut fragsz = 0;
+        let mut i = fsb.0;
+        while i < self.blknum(fsb).0 + self.fs_frag as i64 {
+            let blkoff = (i - blk_start.0) as usize;
+            if isclr(map, blkoff) {
+                break;
+            }
+
+            i += 1;
+            fragsz += 1;
+        }
+        fragsz
+    }
+
     fn blk_free<'a, 'b>(&mut self, buf: &mut [u8], fsb: FragIdx, frags: i64) {
         let c = self.dtog(fsb);
 
@@ -1203,18 +1222,7 @@ impl Fs {
             i -= 1;
             frag_before += 1;
         }
-
-        let mut frag_after = 0;
-        let mut i = fsb.0 + frags;
-        while i < self.blknum(fsb).0 + self.fs_frag as i64 {
-            let blkoff = (i - blk_start.0) as usize;
-            if isclr(map, blkoff) {
-                break;
-            }
-
-            i += 1;
-            frag_after += 1;
-        }
+        let mut frag_after = self.freefragsz(buf, FragIdx(fsb.0 + frags));
 
         // accounting
         let cgbuf = self.cgbuf_mut(buf, c);
@@ -1624,25 +1632,31 @@ impl Fs {
 
                     blk
                 } else if frags_prev < frags_next {
+                    let expandsz = (frags_next - frags_prev) as usize;
+                    let fragsz = self.freefragsz(buf, FragIdx(blk.0 + frags_prev));
+
                     // try to realloc in-place
                     let c = self.dtog(blk);
                     let blk_start = self.cgbase(c);
                     let map = self.cg_blksfree_mut(buf, c);
-                    let mut inplace = true;
-                    for f in frags_prev..frags_next {
-                        let blkoff = (blk.0 - blk_start.0 + f) as usize;
-                        if isclr(map, blkoff) {
-                            inplace = false;
-                            break;
-                        }
-                    }
 
-                    if inplace {
-                        // TODO: fragment accounting
+                    if fragsz >= expandsz {
                         for f in frags_prev..frags_next {
                             let blkoff = (blk.0 - blk_start.0 + f) as usize;
                             clrbit(map, blkoff);
                         }
+
+                        // accounting
+                        let cgbuf = self.cgbuf_mut(buf, c);
+                        let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
+
+                        cg.cg_frsum[fragsz] -= 1;
+
+                        let remainfragsz = fragsz - expandsz;
+                        if remainfragsz > 0 {
+                            cg.cg_frsum[remainfragsz] += 1;
+                        }
+                        cg.cg_cs.cs_nffree -= expandsz as i32;
 
                         let blkbuf = self.blk0_mut(buf, blk);
                         (&mut blkbuf[osize as usize..nsize as usize]).fill(0);
@@ -1661,6 +1675,9 @@ impl Fs {
                         blk_next
                     }
                 } else {
+                    let shirinksz = (frags_prev - frags_next) as usize;
+                    let fragsz = self.freefragsz(buf, FragIdx(blk.0 + frags_prev));
+
                     // shirink
                     // handle bitmap
                     let c = self.dtog(blk);
@@ -1671,6 +1688,18 @@ impl Fs {
                         let blkoff = (blk.0 - blk_start.0 + i) as usize;
                         assert!(isclr(map, blkoff));
                         setbit(map, blkoff);
+                    }
+
+                    // accounting
+                    let cgbuf = self.cgbuf_mut(buf, c);
+                    let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
+                    cg.cg_cs.cs_nffree += shirinksz as i32;
+
+                    cg.cg_frsum[fragsz] -= 1;
+                    if fragsz + shirinksz < self.fs_frag as usize {
+                        cg.cg_frsum[fragsz + shirinksz] += 1;
+                    } else {
+                        cg.cg_cs.cs_nbfree += 1;
                     }
 
                     // TODO: fragment accounting
