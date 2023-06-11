@@ -2704,7 +2704,7 @@ impl<'a> Filesystem for FFS<'a> {
             reply.error(ENOENT);
             return;
         }
-        if dinode.di_mode as usize & IFDIR == IFDIR {
+        if dinode.mode(IFDIR) {
             reply.error(EISDIR);
             return;
         }
@@ -2713,7 +2713,10 @@ impl<'a> Filesystem for FFS<'a> {
 
         let blkstart = offset as usize / self.fs.fs_bsize as usize;
         let blkend = howmany(end as usize, self.fs.fs_bsize as usize);
-        self.fs.dinode_realloc(self.buf, &mut dinode, end);
+
+        if end > dinode.di_size as i64 {
+            self.fs.dinode_realloc(self.buf, &mut dinode, end);
+        }
 
         let mut written = 0;
         for blk in blkstart..blkend {
