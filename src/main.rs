@@ -2445,7 +2445,6 @@ impl<'a> Filesystem for FFS<'a> {
         };
 
         let mut dinode = self.fs.dinode(self.buf, inumber);
-        dinode_p.di_nlink -= 1;
         dinode.di_nlink -= 1;
 
         if dinode.di_nlink == 0 {
