@@ -1906,6 +1906,7 @@ impl Fs {
                 continue;
             }
 
+            let mut offset = 0;
             let mut found = false;
             for (direct, filename) in direct_parse(blkbuf) {
                 if filename == name {
@@ -1913,7 +1914,14 @@ impl Fs {
                     found = true;
                     continue;
                 }
-                direct_append(&mut blkbuf_out, *direct, filename.as_bytes());
+                match direct_append(&mut blkbuf_out, offset, *direct, filename.as_bytes()) {
+                    AppendResult::InPlace(offset_next) => {
+                        offset = offset_next;
+                    }
+                    AppendResult::Failed => {
+                        unreachable!();
+                    }
+                }
             }
 
             assert!(found);
@@ -1946,16 +1954,13 @@ impl Fs {
 
             assert!(nblk > 0);
 
-            let lastblk = nblk - 1;
-            let blkbuf = self.blkat_mut(buf, dinode, lastblk as usize);
-
-            let mut blkoff = self.blkoff(dinode.di_size as i64);
-            if blkoff == 0 {
-                blkoff += self.fs_bsize as i64;
-            }
-            let devbuf = &mut blkbuf[..(blkoff as usize)];
-
-            match direct_append(devbuf, direct, name) {
+            let blkno = nblk - 1;
+            let remain = match self.blkoff(dinode.di_size as i64) {
+                0 => self.fs_bsize as usize,
+                off => off as usize,
+            };
+            let blkbuf = &mut self.blkat_mut(buf, &dinode, blkno as usize)[..remain];
+            match direct_append(blkbuf, 0, direct, name) {
                 InPlace(_) => return,
                 Failed => {
                     let size_prev = dinode.di_size;

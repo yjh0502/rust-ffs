@@ -72,13 +72,23 @@ pub fn direct_init(mut blkbuf: &mut [u8]) {
     }
 }
 
-pub fn direct_append(blkbuf: &mut [u8], direct: Direct, name: &[u8]) -> AppendResult {
+pub fn direct_append(
+    blkbuf: &mut [u8],
+    mut offset: usize,
+    direct: Direct,
+    name: &[u8],
+) -> AppendResult {
     let sz = directsiz(name.len() as u8);
 
-    let mut offset = 0;
     while blkbuf.len() >= offset + directsiz(0) {
         let dp: &Direct = unsafe { transmute(&blkbuf[offset]) };
-        assert!(dp.d_reclen > 0);
+        assert!(
+            dp.d_reclen > 0,
+            "invalid dp: offset={}/{}, dp={:?}",
+            offset,
+            blkbuf.len(),
+            dp
+        );
 
         let dpsz = if dp.d_ino == 0 {
             // empty slot
