@@ -1337,7 +1337,7 @@ impl Fs {
         let mut i = fsb.0 - 1;
         while i >= self.blknum(fsb).0 {
             let blkoff = (i - blk_start.0) as usize;
-            if isset(map, blkoff) {
+            if isclr(map, blkoff) {
                 break;
             }
 
@@ -1347,9 +1347,9 @@ impl Fs {
 
         let mut frag_after = 0;
         let mut i = fsb.0 + frags;
-        while i < self.blknum(FragIdx(fsb.0 + 1)).0 {
+        while i < self.blknum(fsb).0 + self.fs_frag as i64 {
             let blkoff = (i - blk_start.0) as usize;
-            if isset(map, blkoff) {
+            if isclr(map, blkoff) {
                 break;
             }
 
