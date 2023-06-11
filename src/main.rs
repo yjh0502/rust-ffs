@@ -1324,8 +1324,10 @@ impl Fs {
         let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
 
         let fragsz = self.fs_frag as usize - nblk as usize;
-        cg.cg_frsum[fragsz] += 1;
-        cg.cg_cs.cs_nffree += fragsz as i32;
+        if fragsz > 0 {
+            cg.cg_frsum[fragsz] += 1;
+            cg.cg_cs.cs_nffree += fragsz as i32;
+        }
 
         let blkbuf = self.blk0_mut(buf, blkno);
         (&mut blkbuf[0..nblk as usize * self.fs_fsize as usize]).fill(0);
