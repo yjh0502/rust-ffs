@@ -46,7 +46,7 @@ const NIADDR: usize = 3;
 #[derive(Clone, Copy, Debug)]
 struct CgIdx(i64);
 
-#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Add)]
 struct BlkIdx(i64);
 
 #[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Add, Sub, AddAssign, SubAssign)]
@@ -616,8 +616,8 @@ impl Fs {
     }
 
     /* calculates ((off_t)blk * fs->fs_bsize) */
-    fn lblktosize(&self, blk: i64) -> i64 {
-        blk << self.fs_bshift
+    fn lblktosize(&self, blk: BlkIdx) -> i64 {
+        blk.0 << self.fs_bshift
     }
 
     /* calculates (loc / fs->fs_bsize) */
@@ -2703,7 +2703,7 @@ impl<'a> Filesystem for FFS<'a> {
 
         let end = offset + data.len() as i64;
 
-        let blkstart = offset / self.fs.fs_bsize as i64;
+        let blkstart = self.fs.lblkno(offset).0;
         let blkend = howmany!(end, self.fs.fs_bsize as i64);
 
         if end > dinode.di_size as i64 {
@@ -2712,10 +2712,11 @@ impl<'a> Filesystem for FFS<'a> {
 
         let mut written = 0;
         for blk in blkstart..blkend {
-            let buf = self.fs.blkat_mut(self.buf, &dinode, BlkIdx(blk));
+            let blk = BlkIdx(blk);
+            let buf = self.fs.blkat_mut(self.buf, &dinode, blk);
 
-            let bufmin = blk as i64 * self.fs.fs_bsize as i64;
-            let bufmax = (blk + 1) as i64 * self.fs.fs_bsize as i64;
+            let bufmin = self.fs.lblktosize(blk);
+            let bufmax = self.fs.lblktosize(blk + BlkIdx(1));
 
             let srcmin = (bufmin - offset).max(0);
             let srcmax = (bufmax - offset).min(data.len() as i64);
