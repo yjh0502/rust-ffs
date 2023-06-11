@@ -1943,7 +1943,7 @@ impl Fs {
             let devbuf = &mut blkbuf[..(blkoff as usize)];
 
             match direct_append(devbuf, direct, name) {
-                InPlace => return,
+                InPlace(_) => return,
                 Failed => {
                     let size_next = dinode.di_size + DEV_BSIZE as u64;
                     self.dinode_realloc(buf, dinode, size_next as i64);

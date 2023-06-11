@@ -57,7 +57,7 @@ pub fn direct_write(buf: &mut [u8], mut direct: Direct, name: &[u8]) {
 }
 
 pub enum AppendResult {
-    InPlace,
+    InPlace(usize),
     NewBlock(usize),
     Failed,
 }
@@ -90,7 +90,7 @@ pub fn direct_append(blkbuf: &mut [u8], direct: Direct, name: &[u8]) -> AppendRe
 
             direct_write(buf0, *dp, &dpnambuf[..dp.d_namlen as usize]);
             direct_write(buf1, direct, name);
-            return AppendResult::InPlace;
+            return AppendResult::InPlace(offset);
         }
 
         offset += dp.d_reclen as usize;
