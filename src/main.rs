@@ -1127,6 +1127,26 @@ impl Fs {
         self.indirat1(buf, dinode, r)
     }
 
+    fn inobuf<'a, 'b, 'c>(
+        &'a self,
+        buf: &'b [u8],
+        ino: &'c Ufs2Dinode,
+        offset: i64,
+        len: i64,
+    ) -> &'b [u8] {
+        assert!(offset >= 0 && len >= 0);
+
+        let blkno = self.lblkno(offset);
+        let blkno_end = self.lblkno(offset + len);
+        assert_eq!(blkno, blkno_end);
+
+        let blkpos = self.blkpos(blkno as usize);
+        let fsb = self.indirat(buf, ino, blkpos);
+        let blkbuf = self.blk0(buf, fsb);
+
+        &blkbuf[self.blkoff(offset) as usize..self.blkoff(offset + len) as usize]
+    }
+
     fn read(&self, buf: &[u8], ino: &Ufs2Dinode) -> Vec<u8> {
         let mut out = Vec::with_capacity(ino.di_size as usize);
 
@@ -1293,6 +1313,9 @@ impl Fs {
         let fragsz = self.fs_frag as usize - nblk as usize;
         cg.cg_frsum[fragsz] += 1;
         cg.cg_cs.cs_nffree += fragsz as i32;
+
+        let blkbuf = self.blk0_mut(buf, blkno);
+        (&mut blkbuf[0..nblk as usize * self.fs_fsize as usize]).fill(0);
 
         blkno
     }
@@ -1613,6 +1636,9 @@ impl Fs {
                             clrbit(map, blkoff);
                         }
 
+                        let blkbuf = self.blk0_mut(buf, blk);
+                        (&mut blkbuf[osize as usize..nsize as usize]).fill(0);
+
                         blk
                     } else {
                         let blk_next = self.blk_alloc(buf, frags_next);
@@ -1620,8 +1646,7 @@ impl Fs {
                         let blkbuf = self.blk0(buf, blk).to_vec();
                         let blkbuf_next = self.blk0_mut(buf, blk_next);
                         (&mut blkbuf_next[..blkbuf.len()]).copy_from_slice(&blkbuf[..]);
-
-                        (&mut buf[osize as usize..nsize as usize]).fill(0);
+                        (&mut blkbuf_next[osize as usize..nsize as usize]).fill(0);
 
                         self.blk_free(buf, blk, frags_prev);
 
@@ -2716,6 +2741,7 @@ fn main() -> Result<()> {
         MountOption::RW,
         MountOption::AutoUnmount,
         MountOption::AllowRoot,
+        MountOption::CUSTOM("nonempty".to_string()),
         MountOption::FSName("ffs".to_string()),
     ];
 

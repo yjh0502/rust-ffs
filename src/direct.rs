@@ -68,11 +68,11 @@ pub fn direct_append(blkbuf: &mut [u8], direct: Direct, name: &[u8]) -> AppendRe
     let mut offset = 0;
     while blkbuf.len() >= offset + directsiz(0) {
         let dp: &Direct = unsafe { transmute(&blkbuf[offset]) };
-        if dp.d_ino == 0 {
+        if dp.d_reclen == 0 {
             break;
         }
         assert!(dp.d_namlen > 0);
-        assert!(dp.d_reclen > 0);
+        assert!(dp.d_ino > 0);
 
         let dpsz = directsiz(dp.d_namlen);
 
@@ -116,11 +116,11 @@ pub fn direct_parse(blk: &[u8]) -> Vec<(&Direct, &str)> {
     let mut offset = 0;
     while offset < blk.len() {
         let dp: &Direct = unsafe { transmute(&blk[offset]) };
-        if dp.d_ino == 0 {
+        if dp.d_reclen == 0 {
             break;
         }
         trace!("direct_parse: offset={}/{}, dp={:?}", offset, blk.len(), dp);
-        assert!(dp.d_reclen > 0);
+        assert!(dp.d_ino > 0);
 
         let namebuf: &[u8] = unsafe {
             let buf: *const u8 = transmute(&blk[offset + std::mem::size_of::<Direct>()]);
