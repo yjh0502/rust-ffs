@@ -2282,7 +2282,7 @@ impl<'a> Filesystem for FFS<'a> {
             dinode.di_gid = gid;
         }
         if let Some(size) = size {
-            dinode.di_size = size as u64;
+            self.fs.dinode_realloc(self.buf, &mut dinode, size as i64);
         }
         if let Some(atime) = atime {
             let d = match atime {
