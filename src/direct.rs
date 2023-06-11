@@ -124,7 +124,6 @@ pub fn direct_parse(blk: &[u8]) -> Vec<(&Direct, &str)> {
     while offset < blk.len() {
         let dp: &Direct = unsafe { transmute(&blk[offset]) };
         if dp.d_ino == 0 {
-            eprintln!("offset={}/{}, dp={:?}", offset, blk.len(), dp);
             offset += dp.d_reclen as usize;
             continue;
         }
