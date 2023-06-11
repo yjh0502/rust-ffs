@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.71"
 argh = "0.1.10"
+derive_more = "0.99.17"
 env_logger = "0.10.0"
 fuse = "0.3.1"
 fuser = "0.12.0"
