@@ -1054,6 +1054,35 @@ fn direct_parse(blk: &[u8]) -> Vec<(&Direct, &str)> {
     out
 }
 
+fn direct_empty(blk: &[u8], ino: u32, ino_parent: u32) -> bool {
+    let mut offset = 0;
+    while offset < blk.len() {
+        let dp: &Direct = unsafe { transmute(&blk[offset]) };
+        if dp.d_reclen == 0 {
+            return false;
+        }
+        if dp.d_ino == 0 {
+            continue;
+        }
+
+        let namebuf: &[u8] = unsafe {
+            let buf: *const u8 = transmute(&blk[offset + std::mem::size_of::<Direct>()]);
+            from_raw_parts(buf, dp.d_namlen as usize)
+        };
+
+        offset += dp.d_reclen as usize;
+
+        if namebuf == b"." && dp.d_ino == ino {
+            continue;
+        }
+        if namebuf == b".." && dp.d_ino == ino_parent {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 // extra helpers
 impl Fs {
     fn check0(&self) {
@@ -1265,12 +1294,14 @@ impl Fs {
         while out.len() < ino.di_size as usize {
             let blkno = out.len() / self.fs_bsize as usize;
             let blk = self.blkat(buf, ino, blkno);
-            let blkbuf = &blk[..blk.len().min(ino.di_size as usize - out.len())];
+            let len = blk.len().min(ino.di_size as usize - out.len());
+            let blkbuf = &blk[..len];
             out.extend_from_slice(blkbuf);
         }
 
-        assert!(
-            out.len() == ino.di_size as usize,
+        assert_eq!(
+            out.len(),
+            ino.di_size as usize,
             "{}/{}",
             out.len(),
             ino.di_size
@@ -1567,20 +1598,20 @@ impl Fs {
     }
 
     // free indirect block when all freeing a first block of the indiect block
-    fn dinode_freeat(&mut self, buf: &mut [u8], dinode: &mut Ufs2Dinode, pos: BlkPos) {
+    fn dinode_freeat(&mut self, buf: &mut [u8], dinode: &mut Ufs2Dinode, pos: BlkPos, frags: i64) {
         trace!("dinode_freeat, pos={:?}", pos);
         let fs_frag = self.fs_frag as i64;
         use BlkPos::*;
         match pos {
             Direct(n) => {
                 assert_ne!(dinode.di_db[n as usize], 0);
-                self.blk_free(buf, FragIdx(dinode.di_db[n as usize]), fs_frag);
+                self.blk_free(buf, FragIdx(dinode.di_db[n as usize]), frags);
             }
             Indirect1(n) => {
                 let root = &mut dinode.di_ib[0];
                 assert_ne!(*root, 0);
                 let blkno0 = self.blk_indir_take(buf, FragIdx(*root), n as usize);
-                self.blk_free(buf, blkno0, fs_frag);
+                self.blk_free(buf, blkno0, frags);
 
                 if n == 0 {
                     self.blk_free(buf, FragIdx(*root), fs_frag);
@@ -1593,7 +1624,7 @@ impl Fs {
                 assert_ne!(*root, 0);
                 let blkno0 = self.blk_indir_at(buf, FragIdx(*root), n0 as usize);
                 let blkno1 = self.blk_indir_take(buf, blkno0, n1 as usize);
-                self.blk_free(buf, blkno1, fs_frag);
+                self.blk_free(buf, blkno1, frags);
 
                 if n1 == 0 {
                     self.blk_indir_set(buf, FragIdx(*root), n0 as usize, FragIdx(0));
@@ -1613,7 +1644,7 @@ impl Fs {
                 let blkno0 = self.blk_indir_at(buf, FragIdx(*root), n0 as usize);
                 let blkno1 = self.blk_indir_at(buf, blkno0, n1 as usize);
                 let blkno2 = self.blk_indir_take(buf, blkno1, n2 as usize);
-                self.blk_free(buf, blkno2, fs_frag);
+                self.blk_free(buf, blkno2, frags);
 
                 if n2 == 0 {
                     self.blk_indir_set(buf, blkno0, n1 as usize, FragIdx(0));
@@ -1790,7 +1821,7 @@ impl Fs {
         let lblk_next = self.lblkno(nsize);
         let pos_next = self.blkpos(lblk_next as usize);
 
-        let mut nblocks = 0;
+        let mut nfrags = 0;
 
         info!("dinode_realloc: osize={}, nsize={}", dinode.di_size, size);
 
@@ -1819,42 +1850,42 @@ impl Fs {
             let newblk = self.frag_realloc(buf, blk, off_prev, off_next);
 
             // accounting
-            dinode.add_blocks(self.fsbtodb(FragIdx(frags_next - frags_prev)));
+            nfrags += frags_next - frags_prev;
 
             self.indirat1_set(buf, dinode, r, newblk);
 
             pos_prev = pos_prev.next(fs_nindir);
             while pos_prev < pos_next {
                 if let (_, true) = self.dinode_allocat(buf, dinode, pos_prev) {
-                    nblocks += 1;
+                    nfrags += self.fs_frag as i64;
                 }
                 pos_prev = pos_prev.next(fs_nindir);
             }
         } else {
-            // has fragment
-            if self.fragoff(dinode.di_size as i64) > 0 {
-                pos_prev = pos_prev.next(fs_nindir);
+            let frags_prev = self.numfrags(self.blkoff(osize));
+            if frags_prev > 0 {
+                self.dinode_freeat(buf, dinode, pos_prev, frags_prev);
+                nfrags -= frags_prev;
             }
 
-            pos_prev = pos_prev.prev(fs_nindir);
-            while pos_prev >= pos_next {
-                self.dinode_freeat(buf, dinode, pos_prev);
-                nblocks -= 1;
+            while pos_prev > pos_next {
+                pos_prev = pos_prev.prev(fs_nindir);
+                self.dinode_freeat(buf, dinode, pos_prev, self.fs_frag as i64);
+                nfrags -= self.fs_frag as i64;
                 if pos_prev == BlkPos::Direct(0) {
                     break;
                 }
-                pos_prev = pos_prev.prev(fs_nindir);
             }
 
             // TODO: resize to fragment
         }
 
         dinode.di_size = size as u64;
-        dinode.add_blocks(self.fsbtodb(FragIdx(nblocks * self.fs_frag as i64)));
+        dinode.add_blocks(self.fsbtodb(FragIdx(nfrags)));
 
         trace!(
-            "nblocks={}, fs_frag={}, di_blocks={}",
-            nblocks,
+            "nfrags={}, fs_frag={}, di_blocks={}",
+            nfrags,
             self.fs_frag,
             dinode.di_blocks
         );
@@ -2384,11 +2415,8 @@ impl<'a> Filesystem for FFS<'a> {
             .dir_append(self.buf, &mut dinode_p, direct, name.as_bytes());
 
         // update inode
+        self.fs.dinode_update(self.buf, inumber, &dinode);
         self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
-        {
-            dinode_p.di_nlink += 1;
-            self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
-        }
 
         let ino = (inumber - 1) as u64;
         reply.entry(&TTL, &dinode_attr(ino, &dinode), ino);
@@ -2529,6 +2557,13 @@ impl<'a> Filesystem for FFS<'a> {
             reply.error(ENOTEMPTY);
             return;
         }
+
+        let data = self.fs.read(self.buf, &dinode);
+        if !direct_empty(&data, direct.d_ino, inumber_p as u32) {
+            reply.error(ENOTEMPTY);
+            return;
+        }
+
         if let None = self.fs.dir_delete(self.buf, inumber_p, name) {
             reply.error(libc::ENOENT);
             return;
