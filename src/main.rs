@@ -405,7 +405,7 @@ struct Csum {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct CsumTotal {
     cs_ndir: i64,       /* number of directories */
     cs_nbfree: i64,     /* number of free blocks */
@@ -1332,10 +1332,13 @@ impl Fs {
 
         if frag_before > 0 {
             cg.cg_frsum[frag_before] -= 1;
+            cg.cg_cs.cs_nffree -= frag_before as i32;
         }
         if frag_after > 0 {
             cg.cg_frsum[frag_after] -= 1;
+            cg.cg_cs.cs_nffree -= frag_after as i32;
         }
+
         let frag_new = frag_before + frag_after + frags as usize;
         if frag_new == self.fs_frag as usize {
             cg.cg_cs.cs_nbfree += 1;
@@ -1343,6 +1346,7 @@ impl Fs {
             self.fs_cstotal.cs_nbfree += 1;
         } else {
             cg.cg_frsum[frag_new] += 1;
+            cg.cg_cs.cs_nffree += frag_new as i32;
         }
     }
 
@@ -1415,7 +1419,10 @@ impl Fs {
 
         let cgbuf = self.cgbuf_mut(buf, c);
         let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
-        cg.cg_frsum[self.fs_frag as usize - nblk as usize] += 1;
+
+        let fragsz = self.fs_frag as usize - nblk as usize;
+        cg.cg_frsum[fragsz] += 1;
+        cg.cg_cs.cs_nffree += fragsz as i32;
 
         blkno
     }
@@ -2850,13 +2857,21 @@ fn main() -> Result<()> {
         from_raw_parts_mut(transmute(ptr), len)
     };
 
+    let mut fs_cs = CsumTotal::default();
     for c in 0..fs.fs_ncg {
         let c = CgIdx(c as i64);
         let cgbuf = fs.cgbuf(buf, c);
         let cg: &Cg = unsafe { transmute(cgbuf.as_ptr()) };
         println!("cg[{}]: {:?} -> {:?}", c.0, fs_cg[c.0 as usize], cg.cg_cs);
         fs_cg[c.0 as usize] = cg.cg_cs;
+
+        fs_cs.cs_ndir += cg.cg_cs.cs_ndir as i64;
+        fs_cs.cs_nbfree += cg.cg_cs.cs_nbfree as i64;
+        fs_cs.cs_nifree += cg.cg_cs.cs_nifree as i64;
+        fs_cs.cs_nffree += cg.cg_cs.cs_nffree as i64;
     }
+
+    fs.fs_cstotal = fs_cs;
 
     fs_write(buf, &fs, offset);
     fs_write(buf, &fs, fs.alt_offset());
