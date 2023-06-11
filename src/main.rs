@@ -2202,7 +2202,7 @@ fn dinode_attr(ino: u64, dinode: &Ufs2Dinode) -> FileAttr {
     FileAttr {
         ino,
         size: dinode.di_size as u64,
-        blocks: 0,
+        blocks: dinode.di_blocks,
         atime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_atime as u64),
         mtime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_mtime as u64),
         ctime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_ctime as u64),
@@ -2214,7 +2214,7 @@ fn dinode_attr(ino: u64, dinode: &Ufs2Dinode) -> FileAttr {
         gid: dinode.di_gid,
         rdev: 0,
         flags: 0,
-        blksize: 512,
+        blksize: DEV_BSIZE as u32,
     }
 }
 
