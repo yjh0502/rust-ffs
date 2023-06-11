@@ -1,6 +1,6 @@
 use anyhow::Result;
 use argh::FromArgs;
-use libc::{EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
+use libc::{EEXIST, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
 use log::*;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
@@ -214,6 +214,10 @@ impl Ufs2Dinode {
             di_ib: [0i64; NIADDR],
             di_spare: [0i64; 3],
         }
+    }
+
+    fn mode(&self, modeflag: usize) -> bool {
+        self.di_mode as usize & modeflag == modeflag
     }
 
     fn add_blocks(&mut self, count: DevIdx) {
@@ -1396,7 +1400,7 @@ impl Fs {
 
         trace!("dinode_free: csum={:?}", cg.cg_cs);
 
-        if dinode.di_mode as usize & IFMT == IFDIR {
+        if dinode.mode(IFDIR) {
             if self.v2() {
                 self.fs_cstotal.cs_ndir -= 1;
             } else {
@@ -1435,7 +1439,7 @@ impl Fs {
 
         trace!("dinode_alloc: csum={:?}", cg.cg_cs);
 
-        if dinode.di_mode as usize & IFMT == IFDIR {
+        if dinode.mode(IFDIR) {
             if self.v2() {
                 self.fs_cstotal.cs_ndir += 1;
             } else {
@@ -1827,10 +1831,7 @@ impl Fs {
         let dinode = self.dinode(buf, inumber);
         trace!("dir_read: dinode={:?}", dinode);
 
-        let mode = dinode.di_mode as usize & IFMT;
-        if mode & IFDIR == 0 {
-            todo!();
-        }
+        assert!(dinode.mode(IFDIR));
 
         let mut out = Vec::new();
         let mut read = 0;
@@ -1851,8 +1852,7 @@ impl Fs {
     fn dir_lookup(&self, buf: &mut [u8], inumber_p: usize, name: &str) -> Option<Direct> {
         let dinode = self.dinode(buf, inumber_p);
 
-        let mode = dinode.di_mode as usize & IFMT;
-        assert_ne!(mode & IFDIR, 0);
+        assert!(dinode.mode(IFDIR));
 
         let mut read = 0;
         while read < dinode.di_size as usize {
@@ -1874,8 +1874,7 @@ impl Fs {
     fn dir_delete(&self, buf: &mut [u8], inumber_p: usize, name: &str) -> Option<Direct> {
         let dinode_p = self.dinode(buf, inumber_p);
 
-        let mode = dinode_p.di_mode as usize & IFMT;
-        assert_ne!(mode & IFDIR, 0);
+        assert!(dinode_p.mode(IFDIR));
 
         let mut ret = None;
         let mut blkbuf_out = Vec::with_capacity(self.fs_bsize as usize);
@@ -2327,6 +2326,15 @@ impl<'a> Filesystem for FFS<'a> {
         let inumber_p = (parent + 1) as usize;
         let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
         info!("dinode_p={:?}", dinode_p);
+        if !dinode_p.mode(IFDIR) {
+            reply.error(ENOTDIR);
+            return;
+        }
+        let name = name.to_str().unwrap();
+        if let Some(_) = self.fs.dir_lookup(self.buf, inumber_p as usize, name) {
+            reply.error(EEXIST);
+            return;
+        }
 
         let mut dinode = Ufs2Dinode::empty(d);
         dinode.di_mode = mode as u16;
@@ -2336,7 +2344,6 @@ impl<'a> Filesystem for FFS<'a> {
         let inumber = self.fs.inode_alloc(self.buf, &dinode);
 
         // update directory
-        let name = name.to_str().unwrap();
         let direct = Direct {
             d_ino: inumber as u32,
             d_reclen: 0,
@@ -2375,6 +2382,16 @@ impl<'a> Filesystem for FFS<'a> {
         let inumber_p = (parent + 1) as usize;
         let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
         info!("dinode_p={:?}", dinode_p);
+        if !dinode_p.mode(IFDIR) {
+            reply.error(ENOTDIR);
+            return;
+        }
+
+        let name = name.to_str().unwrap();
+        if let Some(_) = self.fs.dir_lookup(self.buf, inumber_p as usize, name) {
+            reply.error(EEXIST);
+            return;
+        }
 
         // make child directory
         // allocate new dinode
@@ -2410,7 +2427,6 @@ impl<'a> Filesystem for FFS<'a> {
         );
 
         // parent to child
-        let name = name.to_str().unwrap();
         self.fs.dir_append(
             self.buf,
             &mut dinode_p,
@@ -2435,7 +2451,6 @@ impl<'a> Filesystem for FFS<'a> {
     /// Remove a file.
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let inumber_p = (parent + 1) as usize;
-        let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
 
         let name = name.to_str().unwrap();
         let inumber = match self.fs.dir_delete(self.buf, inumber_p, name) {
@@ -2454,8 +2469,6 @@ impl<'a> Filesystem for FFS<'a> {
         } else {
             self.fs.dinode_update(self.buf, inumber, &dinode);
         }
-
-        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
 
         reply.ok();
     }
@@ -2480,7 +2493,7 @@ impl<'a> Filesystem for FFS<'a> {
         };
 
         let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
-        if dinode.di_mode as usize & IFMT != IFDIR {
+        if !dinode.mode(IFDIR) {
             reply.error(ENOTDIR);
             return;
         }
@@ -2521,7 +2534,6 @@ impl<'a> Filesystem for FFS<'a> {
     ) {
         let inumber_p = (parent + 1) as usize;
         let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
-
         let inumber_newp = (newparent + 1) as usize;
         let mut dinode_newp = self.fs.dinode(self.buf, inumber_newp);
 
@@ -2529,11 +2541,15 @@ impl<'a> Filesystem for FFS<'a> {
             reply.error(libc::ENOENT);
             return;
         }
+        if !dinode_p.mode(IFDIR) || !dinode_newp.mode(IFDIR) {
+            reply.error(ENOTDIR);
+            return;
+        }
 
         let name = name.to_str().unwrap();
         let newname = newname.to_str().unwrap();
 
-        let mut direct = match self.fs.dir_delete(self.buf, inumber_p, name) {
+        let direct = match self.fs.dir_delete(self.buf, inumber_p, name) {
             Some(direct) => direct,
             None => {
                 reply.error(libc::ENOENT);
@@ -2541,15 +2557,29 @@ impl<'a> Filesystem for FFS<'a> {
             }
         };
 
-        direct.d_namlen = newname.len() as u8;
+        // TODO: make it atomic
+        if let Some(direct) = self.fs.dir_delete(self.buf, inumber_newp, newname) {
+            let ino = direct.d_ino as usize;
+            let mut dinode = self.fs.dinode(self.buf, ino);
+            dinode.di_nlink -= 1;
+
+            if dinode.di_nlink == 0 {
+                self.fs.dinode_free(self.buf, ino, dinode);
+            } else {
+                self.fs.dinode_update(self.buf, ino, &dinode);
+            }
+        }
+
         self.fs
             .dir_append(self.buf, &mut dinode_newp, direct, newname.as_bytes());
 
-        dinode_p.di_nlink -= 1;
-        dinode_newp.di_nlink += 1;
+        if inumber_p != inumber_newp {
+            dinode_p.di_nlink -= 1;
+            dinode_newp.di_nlink += 1;
 
-        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
-        self.fs.dinode_update(self.buf, inumber_newp, &dinode_newp);
+            self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
+            self.fs.dinode_update(self.buf, inumber_newp, &dinode_newp);
+        }
 
         reply.ok();
     }
@@ -2579,7 +2609,7 @@ impl<'a> Filesystem for FFS<'a> {
             d_ino: inumber as u32,
             d_reclen: 0,
             d_type: DT_REG,
-            d_namlen: newname.len() as u8,
+            d_namlen: 0,
         };
         self.fs
             .dir_append(self.buf, &mut dinode_p, direct, newname.as_bytes());
@@ -2646,7 +2676,7 @@ impl<'a> Filesystem for FFS<'a> {
             reply.error(ENOENT);
             return;
         }
-        if dinode.di_mode as usize & IFDIR == 1 {
+        if dinode.di_mode as usize & IFDIR == IFDIR {
             reply.error(EISDIR);
             return;
         }
