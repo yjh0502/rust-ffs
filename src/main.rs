@@ -45,7 +45,7 @@ const NIADDR: usize = 3;
 #[derive(Clone, Copy, Debug)]
 struct CgIdx(i64);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq)]
 struct BlkIdx(i64);
 
 #[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq)]
@@ -620,8 +620,8 @@ impl Fs {
     }
 
     /* calculates (loc / fs->fs_bsize) */
-    fn lblkno(&self, loc: i64) -> i64 {
-        loc >> self.fs_bshift
+    fn lblkno(&self, loc: i64) -> BlkIdx {
+        BlkIdx(loc >> self.fs_bshift)
     }
 
     /* calculates (loc / fs->fs_fsize) */
@@ -743,10 +743,6 @@ macro_rules! howmany {
     ($a:expr, $b:expr) => {
         ($a + $b - 1) / $b
     };
-}
-
-fn howmany(a: usize, b: usize) -> usize {
-    (a + b - 1) / b
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1041,7 +1037,8 @@ impl Fs {
         }
     }
 
-    fn blkpos<'a>(&'a self, blkno: usize) -> BlkPos {
+    fn blkpos<'a>(&'a self, blkno: BlkIdx) -> BlkPos {
+        let blkno = blkno.0 as usize;
         if blkno < NDADDR {
             return BlkPos::Direct(blkno as u16);
         }
@@ -1079,14 +1076,14 @@ impl Fs {
         &'a self,
         buf: &'b mut [u8],
         ino: &'c Ufs2Dinode,
-        blkno: usize,
+        blkno: BlkIdx,
     ) -> &'b mut [u8] {
         let pos = self.blkpos(blkno);
         let blk = self.indirat(buf, ino, pos);
         self.blk0_mut(buf, blk)
     }
 
-    fn blkat<'a, 'b, 'c>(&'a self, buf: &'b [u8], ino: &'c Ufs2Dinode, blkno: usize) -> &'b [u8] {
+    fn blkat<'a, 'b, 'c>(&'a self, buf: &'b [u8], ino: &'c Ufs2Dinode, blkno: BlkIdx) -> &'b [u8] {
         let pos = self.blkpos(blkno);
         let blk = self.indirat(buf, ino, pos);
         self.blk0(buf, blk)
@@ -1145,11 +1142,11 @@ impl Fs {
         let blkno_end = self.lblkno(offset + len - 1);
         assert_eq!(
             blkno, blkno_end,
-            "inobuf_mut: not in one block: {} {}",
+            "inobuf_mut: not in one block: {:?} {:?}",
             offset, len
         );
 
-        let blkpos = self.blkpos(blkno as usize);
+        let blkpos = self.blkpos(blkno);
         let fsb = self.indirat(buf, ino, blkpos);
         let blkbuf = self.blk0_mut(buf, fsb);
 
@@ -1165,7 +1162,7 @@ impl Fs {
         let mut out = Vec::with_capacity(ino.di_size as usize);
 
         while out.len() < ino.di_size as usize {
-            let blkno = out.len() / self.fs_bsize as usize;
+            let blkno = self.lblkno(out.len() as i64);
             let blk = self.blkat(buf, ino, blkno);
             let len = blk.len().min(ino.di_size as usize - out.len());
             let blkbuf = &blk[..len];
@@ -1782,7 +1779,7 @@ impl Fs {
                 let frags_prev = self.fragnum(FragIdx(ofrags)).0;
                 let frags_next = (nfrags - frags_base).min(self.fs_frag as i64);
 
-                let pos = self.blkpos(self.fragstoblks(FragIdx(frags_base)).0 as usize);
+                let pos = self.blkpos(self.fragstoblks(FragIdx(frags_base)));
                 let r = self.dinode_alloc_indir(buf, dinode, pos);
 
                 let blk = if frags_prev > 0 {
@@ -1818,7 +1815,7 @@ impl Fs {
                     break;
                 }
 
-                let pos = self.blkpos(self.fragstoblks(FragIdx(frags_base)).0 as usize);
+                let pos = self.blkpos(self.fragstoblks(FragIdx(frags_base)));
 
                 if frags_next > 0 {
                     let r = self.dinode_alloc_indir(buf, dinode, pos);
@@ -1853,7 +1850,7 @@ impl Fs {
         let mut out = Vec::new();
         let mut read = 0;
         while read < dinode.di_size as usize {
-            let blkno = read / self.fs_bsize as usize;
+            let blkno = self.lblkno(read as i64);
             let remain = (dinode.di_size as usize - read).min(self.fs_bsize as usize);
             let blkbuf = &self.blkat(buf, &dinode, blkno)[..remain];
 
@@ -1872,7 +1869,7 @@ impl Fs {
 
         let mut read = 0;
         while read < dinode.di_size as usize {
-            let blkno = read / self.fs_bsize as usize;
+            let blkno = self.lblkno(read as i64);
             let remain = (dinode.di_size as usize - read).min(self.fs_bsize as usize);
             let blkbuf = &self.blkat(buf, &dinode, blkno)[..remain];
 
@@ -1899,7 +1896,7 @@ impl Fs {
 
         let mut read = 0;
         while read < dinode_p.di_size as usize {
-            let blkno = read / self.fs_bsize as usize;
+            let blkno = self.lblkno(read as i64);
             let remain = (dinode_p.di_size as usize - read).min(self.fs_bsize as usize);
             let blkbuf = &mut self.blkat_mut(buf, &dinode_p, blkno)[..remain];
 
@@ -1962,12 +1959,12 @@ impl Fs {
 
             assert!(nblk > 0);
 
-            let blkno = nblk - 1;
+            let blkno = BlkIdx(nblk - 1);
             let remain = match self.blkoff(dinode.di_size as i64) {
                 0 => self.fs_bsize as usize,
                 off => off as usize,
             };
-            let blkbuf = &mut self.blkat_mut(buf, &dinode, blkno as usize)[..remain];
+            let blkbuf = &mut self.blkat_mut(buf, &dinode, blkno)[..remain];
             match direct_append(blkbuf, 0, direct, name) {
                 InPlace(_) => return,
                 Failed => {
@@ -2719,8 +2716,8 @@ impl<'a> Filesystem for FFS<'a> {
 
         let end = offset + data.len() as i64;
 
-        let blkstart = offset as usize / self.fs.fs_bsize as usize;
-        let blkend = howmany(end as usize, self.fs.fs_bsize as usize);
+        let blkstart = offset / self.fs.fs_bsize as i64;
+        let blkend = howmany!(end, self.fs.fs_bsize as i64);
 
         if end > dinode.di_size as i64 {
             self.fs.dinode_realloc(self.buf, &mut dinode, end);
@@ -2728,7 +2725,7 @@ impl<'a> Filesystem for FFS<'a> {
 
         let mut written = 0;
         for blk in blkstart..blkend {
-            let buf = self.fs.blkat_mut(self.buf, &dinode, blk as usize);
+            let buf = self.fs.blkat_mut(self.buf, &dinode, BlkIdx(blk));
 
             let bufmin = blk as i64 * self.fs.fs_bsize as i64;
             let bufmax = (blk + 1) as i64 * self.fs.fs_bsize as i64;
