@@ -2046,12 +2046,12 @@ fn fsck(buf: &[u8]) {
         };
 
         info!(
-            "inosused={}, {}/{:?}",
+            "inosused={}, {}/{:02X?}",
             inosused,
             inosusedmap.len(),
             inosusedmap,
         );
-        debug!("blksfree={}/{:?}", blksfreemap.len(), blksfreemap,);
+        debug!("blksfree={}/{:02X?}", blksfreemap.len(), blksfreemap);
 
         let ino_start = fs.fs_ipg * c.0 as u32;
         let ino_end = ino_start + inosused;
