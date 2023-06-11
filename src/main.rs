@@ -1399,16 +1399,24 @@ impl Fs {
 
     fn dinode_alloc<'a, 'b>(&mut self, buf: &mut [u8], inumber: usize, dinode: &Ufs2Dinode) {
         let c = self.ino_to_cg(inumber as i64);
-        let map = self.cg_inosused_mut(buf, c);
         let mapidx = inumber % self.fs_ipg as usize;
+
+        let cgbuf = self.cgbuf_mut(buf, c);
+        let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
+        if self.v2() && mapidx >= cg.cg_initediblk as usize {
+            let blkno = self.ino_to_fsba(inumber as i64);
+            let buf = self.blk0_mut(buf, blkno);
+            buf.fill(0);
+
+            cg.cg_initediblk += self.fs_inopb;
+        }
+
+        let map = self.cg_inosused_mut(buf, c);
 
         assert!(isclr(map, mapidx));
         setbit(map, mapidx);
 
         self.dinode_update(buf, inumber, dinode);
-
-        let cgbuf = self.cgbuf_mut(buf, c);
-        let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
 
         trace!("dinode_alloc: csum={:?}", cg.cg_cs);
 
