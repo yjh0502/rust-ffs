@@ -54,6 +54,9 @@ struct FragIdx(i64);
 #[derive(Clone, Copy, Debug)]
 struct DevIdx(i64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Inumber(u64);
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 union Ufs1DinodeU {
@@ -1373,12 +1376,12 @@ impl Fs {
         blkno
     }
 
-    fn dinode<'a, 'b>(&self, buf: &[u8], inumber: usize) -> Ufs2Dinode {
-        let blkno = self.ino_to_fsba(inumber as i64);
+    fn dinode<'a, 'b>(&self, buf: &[u8], inumber: Inumber) -> Ufs2Dinode {
+        let blkno = self.ino_to_fsba(inumber.0 as i64);
         let blkbuf = self.blk0(buf, blkno);
 
         let ino_size = self.fs_bsize as u32 / self.fs_inopb;
-        let offset = (self.ino_to_fsbo(inumber as i64) as u64 * ino_size as u64) as usize;
+        let offset = (self.ino_to_fsbo(inumber.0 as i64) as u64 * ino_size as u64) as usize;
 
         if self.v2() {
             let dinode: &Ufs2Dinode = unsafe { transmute(&blkbuf[offset]) };
@@ -1389,15 +1392,15 @@ impl Fs {
         }
     }
 
-    fn dinode_mut<'a, 'b, F, R>(&self, buf: &mut [u8], inumber: usize, f: F) -> R
+    fn dinode_mut<'a, 'b, F, R>(&self, buf: &mut [u8], inumber: Inumber, f: F) -> R
     where
         F: FnOnce(&mut Ufs2Dinode) -> R,
     {
-        let blkno = self.ino_to_fsba(inumber as i64);
+        let blkno = self.ino_to_fsba(inumber.0 as i64);
         let blkbuf = self.blk0_mut(buf, blkno);
 
         let ino_size = (self.fs_bsize / self.fs_inopb as i32) as u64;
-        let offset = (self.ino_to_fsbo(inumber as i64) as u64 * ino_size) as usize;
+        let offset = (self.ino_to_fsbo(inumber.0 as i64) as u64 * ino_size) as usize;
 
         if self.v2() {
             let dinode: &mut Ufs2Dinode = unsafe { transmute(&mut blkbuf[offset]) };
@@ -1411,7 +1414,7 @@ impl Fs {
         }
     }
 
-    fn dinode_free<'a, 'b>(&mut self, buf: &mut [u8], inumber: usize, mut dinode: Ufs2Dinode) {
+    fn dinode_free<'a, 'b>(&mut self, buf: &mut [u8], inumber: Inumber, mut dinode: Ufs2Dinode) {
         self.dinode_realloc(buf, &mut dinode, 0);
         assert_eq!(dinode.di_blocks, 0);
 
@@ -1422,9 +1425,9 @@ impl Fs {
             *inode = Ufs2Dinode::default();
         });
 
-        let c = self.ino_to_cg(inumber as i64);
+        let c = self.ino_to_cg(inumber.0 as i64);
         let map = self.cg_inosused_mut(buf, c);
-        let mapidx = inumber % self.fs_ipg as usize;
+        let mapidx = inumber.0 as usize % self.fs_ipg as usize;
 
         assert!(isset(map, mapidx));
         clrbit(map, mapidx);
@@ -1450,14 +1453,14 @@ impl Fs {
         trace!("dinode_free: csum={:?}", cg.cg_cs);
     }
 
-    fn dinode_alloc<'a, 'b>(&mut self, buf: &mut [u8], inumber: usize, dinode: &Ufs2Dinode) {
-        let c = self.ino_to_cg(inumber as i64);
-        let mapidx = inumber % self.fs_ipg as usize;
+    fn dinode_alloc<'a, 'b>(&mut self, buf: &mut [u8], inumber: Inumber, dinode: &Ufs2Dinode) {
+        let c = self.ino_to_cg(inumber.0 as i64);
+        let mapidx = inumber.0 as usize % self.fs_ipg as usize;
 
         let cgbuf = self.cgbuf_mut(buf, c);
         let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
         if self.v2() && mapidx >= cg.cg_initediblk as usize {
-            let blkno = self.ino_to_fsba(inumber as i64);
+            let blkno = self.ino_to_fsba(inumber.0 as i64);
             let buf = self.blk0_mut(buf, blkno);
             buf.fill(0);
 
@@ -1491,7 +1494,7 @@ impl Fs {
         trace!("dinode_free: csum={:?}", cg.cg_cs);
     }
 
-    fn dinode_update<'a, 'b>(&self, buf: &mut [u8], inumber: usize, inode: &Ufs2Dinode) {
+    fn dinode_update<'a, 'b>(&self, buf: &mut [u8], inumber: Inumber, inode: &Ufs2Dinode) {
         self.dinode_mut(buf, inumber, |inode1| {
             *inode1 = *inode;
         })
@@ -1855,8 +1858,8 @@ impl Fs {
         dinode.di_size = size as u64;
     }
 
-    fn dir_read<'a>(&'a self, buf: &'a [u8], inumber: usize) -> Vec<(&'a Direct, &'a str)> {
-        let dinode = self.dinode(buf, inumber);
+    fn dir_read<'a>(&'a self, buf: &'a [u8], ino: Inumber) -> Vec<(&'a Direct, &'a str)> {
+        let dinode = self.dinode(buf, ino);
         trace!("dir_read: dinode={:?}", dinode);
 
         assert!(dinode.mode(IFDIR));
@@ -1876,7 +1879,7 @@ impl Fs {
         out
     }
 
-    fn dir_lookup(&self, buf: &mut [u8], inumber_p: usize, name: &str) -> Option<Direct> {
+    fn dir_lookup(&self, buf: &mut [u8], inumber_p: Inumber, name: &str) -> Option<Direct> {
         let dinode = self.dinode(buf, inumber_p);
 
         assert!(dinode.mode(IFDIR));
@@ -1898,7 +1901,7 @@ impl Fs {
         None
     }
 
-    fn dir_delete(&self, buf: &mut [u8], inumber_p: usize, name: &str) -> Option<Direct> {
+    fn dir_delete(&self, buf: &mut [u8], inumber_p: Inumber, name: &str) -> Option<Direct> {
         let dinode_p = self.dinode(buf, inumber_p);
 
         assert!(dinode_p.mode(IFDIR));
@@ -1995,33 +1998,33 @@ impl Fs {
         }
     }
 
-    fn inode_alloc<'a, 'b>(&'a mut self, buf: &'b mut [u8], dinode: &Ufs2Dinode) -> usize {
+    fn inode_alloc<'a, 'b>(&'a mut self, buf: &'b mut [u8], dinode: &Ufs2Dinode) -> Inumber {
         for c in 0..self.fs_ncg {
             let c = CgIdx(c as i64);
-            let ino = {
+            let inumber = {
                 let map = self.cg_inosused_mut(buf, c);
-                let mut ino = 0usize;
-                while ino < self.fs_ipg as usize {
-                    if !isset(map, ino) {
+                let mut inumber = 0usize;
+                while inumber < self.fs_ipg as usize {
+                    if !isset(map, inumber) {
                         break;
                     }
-                    ino += 1;
+                    inumber += 1;
                 }
-                if ino == self.fs_ipg as usize {
+                if inumber == self.fs_ipg as usize {
                     continue;
                 }
 
-                (self.fs_ipg * c.0 as u32) as usize + ino
+                Inumber((self.fs_ipg * c.0 as u32) as u64 + inumber as u64)
             };
 
-            self.dinode_alloc(buf, ino, dinode);
-            return ino;
+            self.dinode_alloc(buf, inumber, dinode);
+            return inumber;
         }
         panic!("out of inodes");
     }
 }
 
-fn fs_locate(buf: &[u8]) -> (usize, Fs) {
+fn fs_locate(buf: &[u8]) -> Option<(usize, Fs)> {
     for offset in SBLOCKSEARCH {
         if offset + SBSIZE >= buf.len() {
             continue;
@@ -2039,9 +2042,9 @@ fn fs_locate(buf: &[u8]) -> (usize, Fs) {
             continue;
         }
 
-        return (offset, fs.clone());
+        return Some((offset, fs.clone()));
     }
-    todo!();
+    None
 }
 
 fn fs_write(buf: &mut [u8], fs: &Fs, offset: usize) {
@@ -2053,8 +2056,11 @@ fn fs_write(buf: &mut [u8], fs: &Fs, offset: usize) {
     (&mut buf[offset..offset + len]).copy_from_slice(src);
 }
 
-pub fn fsck(buf: &[u8]) {
-    let (_, fs) = fs_locate(buf);
+pub fn fsck(buf: &[u8]) -> bool {
+    let (_, fs) = match fs_locate(buf) {
+        Some(tup) => tup,
+        None => return false,
+    };
 
     let fs_v2 = fs.fs_magic == FS_UFS2_MAGIC;
 
@@ -2095,7 +2101,7 @@ pub fn fsck(buf: &[u8]) {
         let ino_end = ino_start + inosused;
 
         for inumber in ino_start..ino_end {
-            let ino = fs.dinode(buf, inumber as usize);
+            let ino = fs.dinode(buf, Inumber(inumber as u64));
 
             let mode = ino.di_mode as usize & IFMT;
             if ino.di_mode == 0 {
@@ -2201,6 +2207,8 @@ pub fn fsck(buf: &[u8]) {
             }
         }
     }
+
+    true
 }
 
 use fuser::*;
@@ -2214,14 +2222,64 @@ pub struct FFS<'a> {
     fs: Fs,
 }
 
+impl<'a> FFS<'a> {
+    pub fn getattr(&mut self, inumber: u64) -> FileAttr {
+        let inumber = Inumber(inumber);
+        let dinode = self.fs.dinode(self.buf, inumber);
+        dinode.fileattr(inumber.0)
+    }
+
+    pub fn mknod(&mut self, parent: u64, name: &str, mode: u32) -> Result<u64, i32> {
+        let parent = Inumber(parent);
+        let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d,
+            Err(_) => {
+                return Err(libc::ENOSYS);
+            }
+        };
+
+        let mut dinode_p = self.fs.dinode(self.buf, parent);
+        info!("dinode_p={:?}", dinode_p);
+        if !dinode_p.mode(IFDIR) {
+            return Err(ENOTDIR);
+        }
+        if let Some(_) = self.fs.dir_lookup(self.buf, parent, name) {
+            return Err(EEXIST);
+        }
+
+        let mut dinode = Ufs2Dinode::empty(d);
+        dinode.di_mode = mode as u16;
+        dinode.di_nlink = 1;
+
+        // allocate ino
+        let inumber = self.fs.inode_alloc(self.buf, &dinode);
+
+        // update directory
+        let direct = Direct {
+            d_ino: inumber.0 as u32,
+            d_reclen: 0,
+            d_type: DT_REG,
+            d_namlen: 0,
+        };
+        self.fs
+            .dir_append(self.buf, &mut dinode_p, direct, name.as_bytes());
+
+        // update inode
+        self.fs.dinode_update(self.buf, inumber, &dinode);
+        self.fs.dinode_update(self.buf, parent, &dinode_p);
+
+        Ok(inumber.0)
+    }
+}
+
 impl<'a> Filesystem for &mut FFS<'a> {
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         info!("lookup: parent={}, name={:?}", parent, name);
 
-        let inumber_p = parent + 1;
+        let inumber_p = Inumber(parent + 1);
         let name = name.to_str().unwrap();
-        let direct = match self.fs.dir_lookup(self.buf, inumber_p as usize, name) {
+        let direct = match self.fs.dir_lookup(self.buf, inumber_p, name) {
             Some(direct) => direct,
             None => {
                 reply.error(ENOENT);
@@ -2229,15 +2287,16 @@ impl<'a> Filesystem for &mut FFS<'a> {
             }
         };
 
-        let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
+        let inumber = Inumber(direct.d_ino as u64);
+        let dinode = self.fs.dinode(self.buf, inumber);
 
-        let inumber = direct.d_ino as u64 - 1;
-        reply.entry(&TTL, &dinode.fileattr(inumber), inumber);
+        let ino = inumber.0 - 1;
+        reply.entry(&TTL, &dinode.fileattr(ino), ino);
     }
 
     /// Get file attributes.
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        let inumber = (ino + 1) as usize;
+        let inumber = Inumber(ino + 1);
         info!("getattr: ino={}", ino);
 
         let dinode = self.fs.dinode(self.buf, inumber);
@@ -2268,7 +2327,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let inumber = (ino + 1) as usize;
+        let inumber = Inumber(ino + 1);
         let mut dinode = self.fs.dinode(self.buf, inumber);
 
         if let Some(mode) = mode {
@@ -2333,7 +2392,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
             }
         };
 
-        let inumber_p = (parent + 1) as usize;
+        let inumber_p = Inumber(parent + 1);
         let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
         info!("dinode_p={:?}", dinode_p);
         if !dinode_p.mode(IFDIR) {
@@ -2341,7 +2400,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
             return;
         }
         let name = name.to_str().unwrap();
-        if let Some(_) = self.fs.dir_lookup(self.buf, inumber_p as usize, name) {
+        if let Some(_) = self.fs.dir_lookup(self.buf, inumber_p, name) {
             reply.error(EEXIST);
             return;
         }
@@ -2355,7 +2414,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
 
         // update directory
         let direct = Direct {
-            d_ino: inumber as u32,
+            d_ino: inumber.0 as u32,
             d_reclen: 0,
             d_type: DT_REG,
             d_namlen: 0,
@@ -2367,7 +2426,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
         self.fs.dinode_update(self.buf, inumber, &dinode);
         self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
 
-        let ino = (inumber - 1) as u64;
+        let ino = (inumber.0 - 1) as u64;
         reply.entry(&TTL, &dinode.fileattr(ino), ino);
     }
 
@@ -2389,7 +2448,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
             }
         };
 
-        let inumber_p = (parent + 1) as usize;
+        let inumber_p = Inumber(parent + 1);
         let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
         info!("dinode_p={:?}", dinode_p);
         if !dinode_p.mode(IFDIR) {
@@ -2398,7 +2457,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
         }
 
         let name = name.to_str().unwrap();
-        if let Some(_) = self.fs.dir_lookup(self.buf, inumber_p as usize, name) {
+        if let Some(_) = self.fs.dir_lookup(self.buf, inumber_p, name) {
             reply.error(EEXIST);
             return;
         }
@@ -2417,7 +2476,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
             self.buf,
             &mut dinode,
             Direct {
-                d_ino: inumber as u32,
+                d_ino: inumber.0 as u32,
                 d_reclen: 0,
                 d_type: DT_DIR,
                 d_namlen: 0,
@@ -2428,7 +2487,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
             self.buf,
             &mut dinode,
             Direct {
-                d_ino: inumber_p as u32,
+                d_ino: inumber_p.0 as u32,
                 d_reclen: 0,
                 d_type: DT_DIR,
                 d_namlen: 0,
@@ -2441,7 +2500,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
             self.buf,
             &mut dinode_p,
             Direct {
-                d_ino: inumber as u32,
+                d_ino: inumber.0 as u32,
                 d_reclen: 0,
                 d_type: DT_DIR,
                 d_namlen: 0,
@@ -2454,17 +2513,17 @@ impl<'a> Filesystem for &mut FFS<'a> {
         self.fs.dinode_update(self.buf, inumber, &dinode);
         self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
 
-        let ino = (inumber - 1) as u64;
+        let ino = (inumber.0 - 1) as u64;
         reply.entry(&TTL, &dinode.fileattr(ino), ino);
     }
 
     /// Remove a file.
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let inumber_p = (parent + 1) as usize;
+        let inumber_p = Inumber(parent + 1);
 
         let name = name.to_str().unwrap();
         let inumber = match self.fs.dir_delete(self.buf, inumber_p, name) {
-            Some(direct) => direct.d_ino as usize,
+            Some(direct) => Inumber(direct.d_ino as u64),
             None => {
                 reply.error(libc::ENOENT);
                 return;
@@ -2490,11 +2549,11 @@ impl<'a> Filesystem for &mut FFS<'a> {
             parent, name,
         );
 
-        let inumber_p = (parent + 1) as usize;
+        let inumber_p = Inumber(parent + 1);
         let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
 
         let name = name.to_str().unwrap();
-        let direct = match self.fs.dir_lookup(self.buf, inumber_p as usize, name) {
+        let direct = match self.fs.dir_lookup(self.buf, inumber_p, name) {
             Some(direct) => direct,
             None => {
                 reply.error(ENOENT);
@@ -2502,7 +2561,8 @@ impl<'a> Filesystem for &mut FFS<'a> {
             }
         };
 
-        let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
+        let ino = Inumber(direct.d_ino as u64);
+        let dinode = self.fs.dinode(self.buf, ino);
         if !dinode.mode(IFDIR) {
             reply.error(ENOTDIR);
             return;
@@ -2513,7 +2573,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
         }
 
         let data = self.fs.read(self.buf, &dinode);
-        if !direct_empty(&data, direct.d_ino, inumber_p as u32) {
+        if !direct_empty(&data, ino.0 as u32, inumber_p.0 as u32) {
             reply.error(ENOTEMPTY);
             return;
         }
@@ -2526,7 +2586,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
         dinode_p.di_nlink -= 1;
 
         self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
-        self.fs.dinode_free(self.buf, direct.d_ino as usize, dinode);
+        self.fs.dinode_free(self.buf, ino, dinode);
 
         reply.ok();
     }
@@ -2542,9 +2602,9 @@ impl<'a> Filesystem for &mut FFS<'a> {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let inumber_p = (parent + 1) as usize;
+        let inumber_p = Inumber(parent + 1);
         let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
-        let inumber_newp = (newparent + 1) as usize;
+        let inumber_newp = Inumber(newparent + 1);
         let mut dinode_newp = self.fs.dinode(self.buf, inumber_newp);
 
         if dinode_p.di_mode == 0 || dinode_newp.di_mode == 0 {
@@ -2569,7 +2629,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
 
         // TODO: make it atomic
         if let Some(direct) = self.fs.dir_delete(self.buf, inumber_newp, newname) {
-            let ino = direct.d_ino as usize;
+            let ino = Inumber(direct.d_ino as u64);
             let mut dinode = self.fs.dinode(self.buf, ino);
             dinode.di_nlink -= 1;
 
@@ -2603,8 +2663,8 @@ impl<'a> Filesystem for &mut FFS<'a> {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let inumber = (ino + 1) as usize;
-        let inumber_p = (newparent + 1) as usize;
+        let inumber = Inumber(ino + 1);
+        let inumber_p = Inumber(newparent + 1);
 
         let mut dinode = self.fs.dinode(self.buf, inumber);
         let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
@@ -2616,7 +2676,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
 
         let newname = newname.to_str().unwrap();
         let direct = Direct {
-            d_ino: inumber as u32,
+            d_ino: inumber.0 as u32,
             d_reclen: 0,
             d_type: DT_REG,
             d_namlen: 0,
@@ -2629,7 +2689,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
         self.fs.dinode_update(self.buf, inumber, &dinode);
         self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
 
-        let ino = (inumber - 1) as u64;
+        let ino = (inumber.0 - 1) as u64;
         reply.entry(&TTL, &dinode.fileattr(ino), ino);
     }
 
@@ -2644,7 +2704,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let inumber = (ino + 1) as usize;
+        let inumber = Inumber(ino + 1);
         let dinode = self.fs.dinode(self.buf, inumber);
         if dinode.di_mode == 0 {
             reply.error(ENOENT);
@@ -2689,7 +2749,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let inumber = (ino + 1) as usize;
+        let inumber = Inumber(ino + 1);
         let mut dinode = self.fs.dinode(self.buf, inumber);
         if dinode.di_mode == 0 {
             reply.error(ENOENT);
@@ -2752,9 +2812,9 @@ impl<'a> Filesystem for &mut FFS<'a> {
     ) {
         info!("readdir: ino={}, offset={}", ino, offset);
 
-        let inumber = ino + 1;
+        let inumber = Inumber(ino + 1);
 
-        let directs = self.fs.dir_read(self.buf, inumber as usize);
+        let directs = self.fs.dir_read(self.buf, inumber);
 
         for (i, (direct, name)) in directs.into_iter().enumerate() {
             if i < offset as usize {
@@ -2794,14 +2854,14 @@ impl<'a> Filesystem for &mut FFS<'a> {
 
         let inumber = ino + 1;
 
-        let directs = self.fs.dir_read(self.buf, inumber as usize);
+        let directs = self.fs.dir_read(self.buf, Inumber(inumber as u64));
 
         for (i, (direct, name)) in directs.into_iter().enumerate() {
             if i <= offset as usize {
                 continue;
             }
 
-            let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
+            let dinode = self.fs.dinode(self.buf, Inumber(direct.d_ino as u64));
 
             let ino = (direct.d_ino - 1) as u64;
             if reply.add(ino, (i + 1) as i64, name, &TTL, &dinode.fileattr(ino), 0) {
@@ -2814,16 +2874,15 @@ impl<'a> Filesystem for &mut FFS<'a> {
 }
 
 impl<'a> FFS<'a> {
-    pub fn new(buf: &'a mut [u8]) -> Self {
-        let (offset, mut fs) = fs_locate(buf);
-        FFS { buf, fs }
+    pub fn new(buf: &'a mut [u8]) -> Option<Self> {
+        fs_locate(buf).map(|(_offset, fs)| FFS { buf, fs })
     }
 
     pub fn sync(mut self) {
         let fs = &mut self.fs;
         let buf = self.buf;
 
-        let (offset, _) = fs_locate(buf);
+        let (offset, _) = fs_locate(buf).unwrap();
 
         let fs_cg: &mut [Csum] = unsafe {
             let offset = fs.fs_csaddr * fs.fs_fsize as i64;

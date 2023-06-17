@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
         MountOption::FSName("ffs".to_string()),
     ];
 
-    let mut ffs = FFS::new(&mut map);
+    let mut ffs = FFS::new(&mut map).unwrap();
     fuser::mount2(&mut ffs, "mnt", &options)?;
 
     eprintln!("done");
