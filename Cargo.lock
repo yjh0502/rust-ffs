@@ -123,6 +123,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ffs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argh",
+ "derive_more",
+ "env_logger",
+ "fuse",
+ "fuser",
+ "libc",
+ "log 0.4.19",
+ "memmap2",
+ "memoffset",
+]
+
+[[package]]
 name = "fuse"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -287,22 +303,6 @@ name = "regex-syntax"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "436b050e76ed2903236f032a59761c1eb99e1b0aead2c257922771dab1fc8c78"
-
-[[package]]
-name = "rust-ffs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argh",
- "derive_more",
- "env_logger",
- "fuse",
- "fuser",
- "libc",
- "log 0.4.19",
- "memmap2",
- "memoffset",
-]
 
 [[package]]
 name = "rustc_version"

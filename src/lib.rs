@@ -1,5 +1,4 @@
 use anyhow::Result;
-use argh::FromArgs;
 use derive_more::{Add, AddAssign, Sub, SubAssign};
 use libc::{EEXIST, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
 use log::*;
@@ -425,7 +424,7 @@ struct CsumTotal {
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Fs {
+pub struct Fs {
     fs_firstfield: i32, /* historic file system linked list, */
     fs_unused_1: i32,   /*     used for incore super blocks */
     fs_sblkno: i32,     /* addr of super-block / frags */
@@ -2022,7 +2021,7 @@ impl Fs {
     }
 }
 
-fn fs(buf: &[u8]) -> (usize, Fs) {
+fn fs_locate(buf: &[u8]) -> (usize, Fs) {
     for offset in SBLOCKSEARCH {
         if offset + SBSIZE >= buf.len() {
             continue;
@@ -2054,8 +2053,8 @@ fn fs_write(buf: &mut [u8], fs: &Fs, offset: usize) {
     (&mut buf[offset..offset + len]).copy_from_slice(src);
 }
 
-fn fsck(buf: &[u8]) {
-    let (_, fs) = fs(buf);
+pub fn fsck(buf: &[u8]) {
+    let (_, fs) = fs_locate(buf);
 
     let fs_v2 = fs.fs_magic == FS_UFS2_MAGIC;
 
@@ -2210,12 +2209,12 @@ use std::ffi::OsStr;
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
-struct FFS<'a> {
+pub struct FFS<'a> {
     buf: &'a mut [u8],
-    fs: &'a mut Fs,
+    fs: Fs,
 }
 
-impl<'a> Filesystem for FFS<'a> {
+impl<'a> Filesystem for &mut FFS<'a> {
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         info!("lookup: parent={}, name={:?}", parent, name);
@@ -2814,85 +2813,44 @@ impl<'a> Filesystem for FFS<'a> {
     }
 }
 
-#[derive(FromArgs)]
-/// Reach new heights.
-struct Args {
-    /// enable read-write with mmap
-    #[argh(switch)]
-    rw: bool,
-
-    /// an optional nickname for the pilot
-    #[argh(option)]
-    image: String,
-}
-
-fn main() -> Result<()> {
-    use memmap2::{MmapMut, MmapOptions};
-    use std::fs::{File, OpenOptions};
-
-    env_logger::init();
-
-    let args: Args = argh::from_env();
-
-    let (_file, mut map): (File, MmapMut) = unsafe {
-        if args.rw {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&args.image)?;
-            let map = MmapOptions::new().map_mut(&file)?;
-            (file, map)
-        } else {
-            let file = File::open(&args.image)?;
-            let map = MmapOptions::new().map_copy(&file)?;
-            (file, map)
-        }
-    };
-
-    fsck(&map);
-
-    let options = vec![
-        MountOption::RW,
-        MountOption::AutoUnmount,
-        MountOption::AllowRoot,
-        MountOption::CUSTOM("nonempty".to_string()),
-        MountOption::FSName("ffs".to_string()),
-    ];
-
-    let buf: &mut [u8] = &mut map;
-    let (offset, mut fs) = fs(buf);
-    let ffs = FFS { buf, fs: &mut fs };
-    fuser::mount2(ffs, "mnt", &options)?;
-
-    let fs_cg: &mut [Csum] = unsafe {
-        let offset = fs.fs_csaddr * fs.fs_fsize as i64;
-        let ptr = &mut buf[offset as usize];
-        let len = fs.fs_ncg as usize;
-        from_raw_parts_mut(transmute(ptr), len)
-    };
-
-    let mut fs_cs = CsumTotal::default();
-    for c in 0..fs.fs_ncg {
-        let c = CgIdx(c as i64);
-        let cgbuf = fs.cgbuf(buf, c);
-        let cg: &Cg = unsafe { transmute(cgbuf.as_ptr()) };
-        println!("cg[{}]: {:?} -> {:?}", c.0, fs_cg[c.0 as usize], cg.cg_cs);
-        fs_cg[c.0 as usize] = cg.cg_cs;
-
-        fs_cs.cs_ndir += cg.cg_cs.cs_ndir as i64;
-        fs_cs.cs_nbfree += cg.cg_cs.cs_nbfree as i64;
-        fs_cs.cs_nifree += cg.cg_cs.cs_nifree as i64;
-        fs_cs.cs_nffree += cg.cg_cs.cs_nffree as i64;
+impl<'a> FFS<'a> {
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        let (offset, mut fs) = fs_locate(buf);
+        FFS { buf, fs }
     }
 
-    fs.fs_cstotal = fs_cs;
+    pub fn sync(mut self) {
+        let fs = &mut self.fs;
+        let buf = self.buf;
 
-    fs_write(buf, &fs, offset);
-    fs_write(buf, &fs, fs.alt_offset());
+        let (offset, _) = fs_locate(buf);
 
-    eprintln!("done");
+        let fs_cg: &mut [Csum] = unsafe {
+            let offset = fs.fs_csaddr * fs.fs_fsize as i64;
+            let ptr = &mut buf[offset as usize];
+            let len = fs.fs_ncg as usize;
+            from_raw_parts_mut(transmute(ptr), len)
+        };
 
-    Ok(())
+        let mut fs_cs = CsumTotal::default();
+        for c in 0..fs.fs_ncg {
+            let c = CgIdx(c as i64);
+            let cgbuf = fs.cgbuf(buf, c);
+            let cg: &Cg = unsafe { transmute(cgbuf.as_ptr()) };
+            println!("cg[{}]: {:?} -> {:?}", c.0, fs_cg[c.0 as usize], cg.cg_cs);
+            fs_cg[c.0 as usize] = cg.cg_cs;
+
+            fs_cs.cs_ndir += cg.cg_cs.cs_ndir as i64;
+            fs_cs.cs_nbfree += cg.cg_cs.cs_nbfree as i64;
+            fs_cs.cs_nifree += cg.cg_cs.cs_nifree as i64;
+            fs_cs.cs_nffree += cg.cg_cs.cs_nffree as i64;
+        }
+
+        fs.fs_cstotal = fs_cs;
+
+        fs_write(buf, &fs, offset);
+        fs_write(buf, &fs, fs.alt_offset());
+    }
 }
 
 #[cfg(test)]
