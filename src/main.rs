@@ -229,6 +229,34 @@ impl Ufs2Dinode {
             self.di_blocks -= (-count.0) as u64;
         }
     }
+
+    fn fileattr(&self, ino: u64) -> FileAttr {
+        let kind = if self.di_mode & IFDIR as u16 != 0 {
+            FileType::Directory
+        } else if self.di_mode & IFREG as u16 != 0 {
+            FileType::RegularFile
+        } else {
+            todo!("unknown file type");
+        };
+
+        FileAttr {
+            ino,
+            size: self.di_size as u64,
+            blocks: self.di_blocks,
+            atime: UNIX_EPOCH + std::time::Duration::from_secs(self.di_atime as u64),
+            mtime: UNIX_EPOCH + std::time::Duration::from_secs(self.di_mtime as u64),
+            ctime: UNIX_EPOCH + std::time::Duration::from_secs(self.di_ctime as u64),
+            crtime: UNIX_EPOCH + std::time::Duration::from_secs(self.di_birthtime as u64),
+            kind,
+            perm: self.di_mode,
+            nlink: self.di_nlink as u32,
+            uid: self.di_uid,
+            gid: self.di_gid,
+            rdev: 0,
+            flags: 0,
+            blksize: DEV_BSIZE as u32,
+        }
+    }
 }
 
 // cylinder group
@@ -2187,34 +2215,6 @@ struct FFS<'a> {
     fs: &'a mut Fs,
 }
 
-fn dinode_attr(ino: u64, dinode: &Ufs2Dinode) -> FileAttr {
-    let kind = if dinode.di_mode & IFDIR as u16 != 0 {
-        FileType::Directory
-    } else if dinode.di_mode & IFREG as u16 != 0 {
-        FileType::RegularFile
-    } else {
-        todo!("unknown file type");
-    };
-
-    FileAttr {
-        ino,
-        size: dinode.di_size as u64,
-        blocks: dinode.di_blocks,
-        atime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_atime as u64),
-        mtime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_mtime as u64),
-        ctime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_ctime as u64),
-        crtime: UNIX_EPOCH + std::time::Duration::from_secs(dinode.di_birthtime as u64),
-        kind,
-        perm: dinode.di_mode,
-        nlink: dinode.di_nlink as u32,
-        uid: dinode.di_uid,
-        gid: dinode.di_gid,
-        rdev: 0,
-        flags: 0,
-        blksize: DEV_BSIZE as u32,
-    }
-}
-
 impl<'a> Filesystem for FFS<'a> {
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
@@ -2233,7 +2233,7 @@ impl<'a> Filesystem for FFS<'a> {
         let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
 
         let inumber = direct.d_ino as u64 - 1;
-        reply.entry(&TTL, &dinode_attr(inumber, &dinode), inumber);
+        reply.entry(&TTL, &dinode.fileattr(inumber), inumber);
     }
 
     /// Get file attributes.
@@ -2247,7 +2247,7 @@ impl<'a> Filesystem for FFS<'a> {
             return;
         }
 
-        reply.attr(&TTL, &dinode_attr(ino, &dinode));
+        reply.attr(&TTL, &dinode.fileattr(ino));
     }
 
     /// Set file attributes.
@@ -2311,7 +2311,7 @@ impl<'a> Filesystem for FFS<'a> {
 
         self.fs.dinode_update(self.buf, inumber, &dinode);
 
-        reply.attr(&TTL, &dinode_attr(ino, &dinode));
+        reply.attr(&TTL, &dinode.fileattr(ino));
     }
 
     /// Create file node.
@@ -2369,7 +2369,7 @@ impl<'a> Filesystem for FFS<'a> {
         self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
 
         let ino = (inumber - 1) as u64;
-        reply.entry(&TTL, &dinode_attr(ino, &dinode), ino);
+        reply.entry(&TTL, &dinode.fileattr(ino), ino);
     }
 
     /// Create a directory.
@@ -2456,7 +2456,7 @@ impl<'a> Filesystem for FFS<'a> {
         self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
 
         let ino = (inumber - 1) as u64;
-        reply.entry(&TTL, &dinode_attr(ino, &dinode), ino);
+        reply.entry(&TTL, &dinode.fileattr(ino), ino);
     }
 
     /// Remove a file.
@@ -2631,7 +2631,7 @@ impl<'a> Filesystem for FFS<'a> {
         self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
 
         let ino = (inumber - 1) as u64;
-        reply.entry(&TTL, &dinode_attr(ino, &dinode), ino);
+        reply.entry(&TTL, &dinode.fileattr(ino), ino);
     }
 
     fn read(
@@ -2805,14 +2805,7 @@ impl<'a> Filesystem for FFS<'a> {
             let dinode = self.fs.dinode(self.buf, direct.d_ino as usize);
 
             let ino = (direct.d_ino - 1) as u64;
-            if reply.add(
-                ino,
-                (i + 1) as i64,
-                name,
-                &TTL,
-                &dinode_attr(ino, &dinode),
-                0,
-            ) {
+            if reply.add(ino, (i + 1) as i64, name, &TTL, &dinode.fileattr(ino), 0) {
                 break;
             }
         }
