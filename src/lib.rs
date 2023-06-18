@@ -2261,10 +2261,69 @@ impl<'a> FFS<'a> {
         }
     }
 
-    pub fn getattr(&mut self, inumber: u64) -> FileAttr {
+    pub fn getattr0(&mut self, inumber: u64) -> FileAttr {
         let inumber = Inumber(inumber);
         let dinode = self.fs.dinode(self.buf, inumber);
         dinode.fileattr(inumber.0)
+    }
+
+    /// Set file attributes.
+    pub fn setattr0(
+        &mut self,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
+        flags: Option<u32>,
+    ) -> Result<FileAttr, i32> {
+        self.check_ino(ino)?;
+
+        let ino = Inumber(ino);
+        let mut dinode = self.fs.dinode(self.buf, ino);
+
+        if let Some(mode) = mode {
+            dinode.di_mode = mode as u16;
+        }
+        if let Some(uid) = uid {
+            dinode.di_uid = uid;
+        }
+        if let Some(gid) = gid {
+            dinode.di_gid = gid;
+        }
+        if let Some(size) = size {
+            self.fs.dinode_realloc(self.buf, &mut dinode, size as i64);
+        }
+        if let Some(atime) = atime {
+            let d = match atime {
+                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
+                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
+            };
+            dinode.di_atime = d.as_secs() as i64;
+            dinode.di_atimensec = d.subsec_nanos() as i32;
+        }
+        if let Some(mtime) = mtime {
+            let d = match mtime {
+                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
+                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
+            };
+            dinode.di_mtime = d.as_secs() as i64;
+            dinode.di_mtimensec = d.subsec_nanos() as i32;
+        }
+        if let Some(ctime) = ctime {
+            let d = ctime.duration_since(UNIX_EPOCH).unwrap();
+            dinode.di_ctime = d.as_secs() as i64;
+            dinode.di_ctimensec = d.subsec_nanos() as i32;
+        }
+        if let Some(flags) = flags {
+            dinode.di_flags = flags;
+        }
+
+        self.fs.dinode_update(self.buf, ino, &dinode);
+        Ok(dinode.fileattr(ino.0))
     }
 
     pub fn lookup0(&mut self, parent: u64, name: &str) -> Result<FileAttr, i32> {
@@ -2610,49 +2669,15 @@ impl<'a> Filesystem for &mut FFS<'a> {
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let inumber = Inumber(ino + 1);
-        let mut dinode = self.fs.dinode(self.buf, inumber);
-
-        if let Some(mode) = mode {
-            dinode.di_mode = mode as u16;
+        match self.setattr0(ino + 1, mode, uid, gid, size, atime, mtime, ctime, flags) {
+            Ok(mut attr) => {
+                attr.ino -= 1;
+                reply.attr(&TTL, &attr);
+            }
+            Err(e) => {
+                reply.error(e);
+            }
         }
-        if let Some(uid) = uid {
-            dinode.di_uid = uid;
-        }
-        if let Some(gid) = gid {
-            dinode.di_gid = gid;
-        }
-        if let Some(size) = size {
-            self.fs.dinode_realloc(self.buf, &mut dinode, size as i64);
-        }
-        if let Some(atime) = atime {
-            let d = match atime {
-                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
-                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
-            };
-            dinode.di_atime = d.as_secs() as i64;
-            dinode.di_atimensec = d.subsec_nanos() as i32;
-        }
-        if let Some(mtime) = mtime {
-            let d = match mtime {
-                TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap(),
-                TimeOrNow::Now => SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
-            };
-            dinode.di_mtime = d.as_secs() as i64;
-            dinode.di_mtimensec = d.subsec_nanos() as i32;
-        }
-        if let Some(ctime) = ctime {
-            let d = ctime.duration_since(UNIX_EPOCH).unwrap();
-            dinode.di_ctime = d.as_secs() as i64;
-            dinode.di_ctimensec = d.subsec_nanos() as i32;
-        }
-        if let Some(flags) = flags {
-            dinode.di_flags = flags;
-        }
-
-        self.fs.dinode_update(self.buf, inumber, &dinode);
-
-        reply.attr(&TTL, &dinode.fileattr(ino));
     }
 
     /// Create file node.
