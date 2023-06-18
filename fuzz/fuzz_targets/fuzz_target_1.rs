@@ -25,6 +25,17 @@ pub enum Op {
         parent: u64,
         name: String,
     },
+    Rename {
+        parent: u64,
+        name: String,
+        newparent: u64,
+        newname: String,
+    },
+    Link {
+        ino: u64,
+        parent: u64,
+        newname: String,
+    },
 }
 
 fuzz_target!(|ops: Vec<Op>| {
@@ -46,6 +57,21 @@ fuzz_target!(|ops: Vec<Op>| {
             }
             Op::Rmdir { parent, name } => {
                 ffs.rmdir0(parent, &name).ok();
+            }
+            Op::Rename {
+                parent,
+                name,
+                newparent,
+                newname,
+            } => {
+                ffs.rename0(parent, &name, newparent, &newname).ok();
+            }
+            Op::Link {
+                ino,
+                parent,
+                newname,
+            } => {
+                ffs.link0(ino, parent, &newname).ok();
             }
         }
     }

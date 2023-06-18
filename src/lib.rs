@@ -2469,6 +2469,97 @@ impl<'a> FFS<'a> {
 
         Ok(())
     }
+
+    /// Rename a file.
+    pub fn rename0(
+        &mut self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+    ) -> Result<(), i32> {
+        self.check_ino(parent)?;
+        self.check_ino(newparent)?;
+        self.check_name(name)?;
+        self.check_name(newname)?;
+
+        let parent = Inumber(parent);
+        let newparent = Inumber(newparent);
+        let mut dinode_p = self.fs.dinode(self.buf, parent);
+        let mut dinode_newp = self.fs.dinode(self.buf, newparent);
+
+        if dinode_p.di_mode == 0 || dinode_newp.di_mode == 0 {
+            return Err(libc::ENOENT);
+        }
+        if !dinode_p.mode(IFDIR) || !dinode_newp.mode(IFDIR) {
+            return Err(ENOTDIR);
+        }
+
+        let direct = match self.fs.dir_delete(self.buf, parent, name) {
+            Some(direct) => direct,
+            None => {
+                return Err(libc::ENOENT);
+            }
+        };
+
+        // TODO: make it atomic
+        if let Some(direct) = self.fs.dir_delete(self.buf, newparent, newname) {
+            let ino = Inumber(direct.d_ino as u64);
+            let mut dinode = self.fs.dinode(self.buf, ino);
+            dinode.di_nlink -= 1;
+
+            if dinode.di_nlink == 0 {
+                self.fs.dinode_free(self.buf, ino, dinode);
+            } else {
+                self.fs.dinode_update(self.buf, ino, &dinode);
+            }
+        }
+
+        self.fs
+            .dir_append(self.buf, &mut dinode_newp, direct, newname.as_bytes());
+
+        if parent != newparent {
+            dinode_p.di_nlink -= 1;
+            dinode_newp.di_nlink += 1;
+
+            self.fs.dinode_update(self.buf, parent, &dinode_p);
+            self.fs.dinode_update(self.buf, newparent, &dinode_newp);
+        }
+
+        Ok(())
+    }
+
+    /// Create a hard link.
+    pub fn link0(&mut self, ino: u64, newparent: u64, newname: &str) -> Result<FileAttr, i32> {
+        self.check_ino(ino)?;
+        self.check_ino(newparent)?;
+        self.check_name(newname)?;
+
+        let ino = Inumber(ino);
+        let newparent = Inumber(newparent);
+
+        let mut dinode = self.fs.dinode(self.buf, ino);
+        let mut dinode_p = self.fs.dinode(self.buf, newparent);
+
+        self.check_if(dinode.di_mode as u32, IFREG)?;
+        self.check_if(dinode_p.di_mode as u32, IFDIR)?;
+
+        let direct = Direct {
+            d_ino: ino.0 as u32,
+            d_reclen: 0,
+            d_type: DT_REG,
+            d_namlen: 0,
+        };
+        self.fs
+            .dir_append(self.buf, &mut dinode_p, direct, newname.as_bytes());
+
+        dinode.di_nlink += 1;
+        dinode_p.di_nlink += 1;
+        self.fs.dinode_update(self.buf, ino, &dinode);
+        self.fs.dinode_update(self.buf, newparent, &dinode_p);
+
+        Ok(dinode.fileattr(ino.0))
+    }
 }
 
 impl<'a> Filesystem for &mut FFS<'a> {
@@ -2643,56 +2734,14 @@ impl<'a> Filesystem for &mut FFS<'a> {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let inumber_p = Inumber(parent + 1);
-        let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
-        let inumber_newp = Inumber(newparent + 1);
-        let mut dinode_newp = self.fs.dinode(self.buf, inumber_newp);
-
-        if dinode_p.di_mode == 0 || dinode_newp.di_mode == 0 {
-            reply.error(libc::ENOENT);
-            return;
-        }
-        if !dinode_p.mode(IFDIR) || !dinode_newp.mode(IFDIR) {
-            reply.error(ENOTDIR);
-            return;
-        }
-
         let name = name.to_str().unwrap();
         let newname = newname.to_str().unwrap();
-
-        let direct = match self.fs.dir_delete(self.buf, inumber_p, name) {
-            Some(direct) => direct,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        // TODO: make it atomic
-        if let Some(direct) = self.fs.dir_delete(self.buf, inumber_newp, newname) {
-            let ino = Inumber(direct.d_ino as u64);
-            let mut dinode = self.fs.dinode(self.buf, ino);
-            dinode.di_nlink -= 1;
-
-            if dinode.di_nlink == 0 {
-                self.fs.dinode_free(self.buf, ino, dinode);
-            } else {
-                self.fs.dinode_update(self.buf, ino, &dinode);
+        match self.rename0(parent + 1, name, newparent + 1, newname) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                reply.error(e);
             }
         }
-
-        self.fs
-            .dir_append(self.buf, &mut dinode_newp, direct, newname.as_bytes());
-
-        if inumber_p != inumber_newp {
-            dinode_p.di_nlink -= 1;
-            dinode_newp.di_nlink += 1;
-
-            self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
-            self.fs.dinode_update(self.buf, inumber_newp, &dinode_newp);
-        }
-
-        reply.ok();
     }
 
     /// Create a hard link.
@@ -2704,34 +2753,16 @@ impl<'a> Filesystem for &mut FFS<'a> {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let inumber = Inumber(ino + 1);
-        let inumber_p = Inumber(newparent + 1);
-
-        let mut dinode = self.fs.dinode(self.buf, inumber);
-        let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
-
-        if dinode.di_mode == 0 || dinode_p.di_mode == 0 {
-            reply.error(libc::ENOENT);
-            return;
-        }
-
         let newname = newname.to_str().unwrap();
-        let direct = Direct {
-            d_ino: inumber.0 as u32,
-            d_reclen: 0,
-            d_type: DT_REG,
-            d_namlen: 0,
-        };
-        self.fs
-            .dir_append(self.buf, &mut dinode_p, direct, newname.as_bytes());
-
-        dinode.di_nlink += 1;
-        dinode_p.di_nlink += 1;
-        self.fs.dinode_update(self.buf, inumber, &dinode);
-        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
-
-        let ino = (inumber.0 - 1) as u64;
-        reply.entry(&TTL, &dinode.fileattr(ino), ino);
+        match self.link0(ino + 1, newparent + 1, newname) {
+            Ok(mut attr) => {
+                attr.ino -= 1;
+                reply.entry(&TTL, &attr, attr.ino);
+            }
+            Err(e) => {
+                reply.error(e);
+            }
+        }
     }
 
     fn read(
