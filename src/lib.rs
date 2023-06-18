@@ -1212,6 +1212,26 @@ impl Fs {
     }
 }
 
+macro_rules! cs {
+    ($field:ident) => {
+        fn $field(&mut self, cg: &mut Cg, n: i64) {
+            if self.v2() {
+                self.fs_cstotal.$field += n;
+            } else {
+                self.fs_ffs1_cstotal.$field += n as i32;
+            }
+            cg.cg_cs.$field += n as i32;
+        }
+    };
+}
+
+impl Fs {
+    cs!(cs_ndir);
+    cs!(cs_nbfree);
+    cs!(cs_nifree);
+    cs!(cs_nffree);
+}
+
 impl Fs {
     fn v2(&self) -> bool {
         self.fs_magic == FS_UFS2_MAGIC
@@ -1273,24 +1293,26 @@ impl Fs {
         // accounting
         let cgbuf = self.cgbuf_mut(buf, c);
         let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
+        let mut frag_delta = 0i64;
 
         if frag_before > 0 {
             cg.cg_frsum[frag_before] -= 1;
-            cg.cg_cs.cs_nffree -= frag_before as i32;
+            frag_delta -= frag_before as i64;
         }
         if frag_after > 0 {
             cg.cg_frsum[frag_after] -= 1;
-            cg.cg_cs.cs_nffree -= frag_after as i32;
+            frag_delta -= frag_after as i64;
         }
 
         let frag_new = frag_before + frag_after + frags.0 as usize;
         if frag_new == self.fs_frag as usize {
-            cg.cg_cs.cs_nbfree += 1;
-            self.fs_ffs1_cstotal.cs_nbfree += 1;
-            self.fs_cstotal.cs_nbfree += 1;
+            self.cs_nbfree(cg, 1);
         } else {
             cg.cg_frsum[frag_new] += 1;
-            cg.cg_cs.cs_nffree += frag_new as i32;
+            frag_delta += frag_new as i64;
+        }
+        if frag_delta != 0 {
+            self.cs_nffree(cg, frag_delta);
         }
     }
 
@@ -1327,9 +1349,7 @@ impl Fs {
             let cgbuf = self.cgbuf_mut(buf, c);
             let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
 
-            cg.cg_cs.cs_nbfree -= 1;
-            self.fs_ffs1_cstotal.cs_nbfree -= 1;
-            self.fs_cstotal.cs_nbfree -= 1;
+            self.cs_nbfree(cg, -1);
 
             return Some(blkno);
         }
@@ -1367,7 +1387,7 @@ impl Fs {
         let fragsz = self.fs_frag as usize - nblk as usize;
         if fragsz > 0 {
             cg.cg_frsum[fragsz] += 1;
-            cg.cg_cs.cs_nffree += fragsz as i32;
+            self.cs_nffree(cg, fragsz as i64);
         }
 
         let blkbuf = self.blk0_mut(buf, blkno);
@@ -1438,17 +1458,10 @@ impl Fs {
         trace!("dinode_free: csum={:?}", cg.cg_cs);
 
         if dinode.mode(IFDIR) {
-            if self.v2() {
-                self.fs_cstotal.cs_ndir -= 1;
-            } else {
-                self.fs_ffs1_cstotal.cs_ndir -= 1;
-            }
-            cg.cg_cs.cs_ndir -= 1;
+            self.cs_ndir(cg, -1);
         }
 
-        self.fs_ffs1_cstotal.cs_nifree += 1;
-        self.fs_cstotal.cs_nifree += 1;
-        cg.cg_cs.cs_nifree += 1;
+        self.cs_nifree(cg, 1);
 
         trace!("dinode_free: csum={:?}", cg.cg_cs);
     }
@@ -1477,17 +1490,10 @@ impl Fs {
         trace!("dinode_alloc: csum={:?}", cg.cg_cs);
 
         if dinode.mode(IFDIR) {
-            if self.v2() {
-                self.fs_cstotal.cs_ndir += 1;
-            } else {
-                self.fs_ffs1_cstotal.cs_ndir += 1;
-            }
-            cg.cg_cs.cs_ndir += 1;
+            self.cs_ndir(cg, 1);
         }
 
-        self.fs_ffs1_cstotal.cs_nifree -= 1;
-        self.fs_cstotal.cs_nifree -= 1;
-        cg.cg_cs.cs_nifree -= 1;
+        self.cs_nifree(cg, -1);
 
         let cgbuf = self.cgbuf_mut(buf, c);
         let cg: &Cg = unsafe { transmute(cgbuf.as_ptr()) };
@@ -1715,7 +1721,7 @@ impl Fs {
                         if remainfragsz > 0 {
                             cg.cg_frsum[remainfragsz] += 1;
                         }
-                        cg.cg_cs.cs_nffree -= expandsz as i32;
+                        self.cs_nffree(cg, -1 * expandsz as i64);
 
                         let blkbuf = self.blk0_mut(buf, blk);
                         (&mut blkbuf[osize as usize..nsize as usize]).fill(0);
@@ -1752,13 +1758,13 @@ impl Fs {
                     // accounting
                     let cgbuf = self.cgbuf_mut(buf, c);
                     let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
-                    cg.cg_cs.cs_nffree += shirinksz as i32;
+                    self.cs_nffree(cg, shirinksz as i64);
 
                     cg.cg_frsum[fragsz] -= 1;
                     if fragsz + shirinksz < self.fs_frag as usize {
                         cg.cg_frsum[fragsz + shirinksz] += 1;
                     } else {
-                        cg.cg_cs.cs_nbfree += 1;
+                        self.cs_nbfree(cg, 1);
                     }
 
                     // TODO: fragment accounting
@@ -2295,6 +2301,10 @@ impl<'a> FFS<'a> {
             dinode.di_gid = gid;
         }
         if let Some(size) = size {
+            // TODO: check max size
+            if size > (1u64 << 32) - 1 {
+                return Err(libc::EFBIG);
+            }
             self.fs.dinode_realloc(self.buf, &mut dinode, size as i64);
         }
         if let Some(atime) = atime {
