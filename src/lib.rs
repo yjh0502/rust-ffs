@@ -1214,7 +1214,19 @@ impl Fs {
 
 macro_rules! cs {
     ($field:ident) => {
-        fn $field(&mut self, cg: &mut Cg, n: i64) {
+        fn $field(&mut self) -> i64 {
+            if self.v2() {
+                self.fs_cstotal.$field
+            } else {
+                self.fs_ffs1_cstotal.$field as i64
+            }
+        }
+    };
+}
+
+macro_rules! cs_add {
+    ($name:ident, $field:ident) => {
+        fn $name(&mut self, cg: &mut Cg, n: i64) {
             if self.v2() {
                 self.fs_cstotal.$field += n;
             } else {
@@ -1230,6 +1242,11 @@ impl Fs {
     cs!(cs_nbfree);
     cs!(cs_nifree);
     cs!(cs_nffree);
+
+    cs_add!(add_ndir, cs_ndir);
+    cs_add!(add_nbfree, cs_nbfree);
+    cs_add!(add_nifree, cs_nifree);
+    cs_add!(add_nffree, cs_nffree);
 }
 
 impl Fs {
@@ -1306,13 +1323,13 @@ impl Fs {
 
         let frag_new = frag_before + frag_after + frags.0 as usize;
         if frag_new == self.fs_frag as usize {
-            self.cs_nbfree(cg, 1);
+            self.add_nbfree(cg, 1);
         } else {
             cg.cg_frsum[frag_new] += 1;
             frag_delta += frag_new as i64;
         }
         if frag_delta != 0 {
-            self.cs_nffree(cg, frag_delta);
+            self.add_nffree(cg, frag_delta);
         }
     }
 
@@ -1349,7 +1366,7 @@ impl Fs {
             let cgbuf = self.cgbuf_mut(buf, c);
             let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
 
-            self.cs_nbfree(cg, -1);
+            self.add_nbfree(cg, -1);
 
             return Some(blkno);
         }
@@ -1387,7 +1404,7 @@ impl Fs {
         let fragsz = self.fs_frag as usize - nblk as usize;
         if fragsz > 0 {
             cg.cg_frsum[fragsz] += 1;
-            self.cs_nffree(cg, fragsz as i64);
+            self.add_nffree(cg, fragsz as i64);
         }
 
         let blkbuf = self.blk0_mut(buf, blkno);
@@ -1435,7 +1452,7 @@ impl Fs {
     }
 
     fn dinode_free<'a, 'b>(&mut self, buf: &mut [u8], inumber: Inumber, mut dinode: Ufs2Dinode) {
-        self.dinode_realloc(buf, &mut dinode, 0);
+        assert!(self.dinode_realloc(buf, &mut dinode, 0));
         assert_eq!(dinode.di_blocks, 0);
 
         dinode.di_size = 0;
@@ -1458,10 +1475,10 @@ impl Fs {
         trace!("dinode_free: csum={:?}", cg.cg_cs);
 
         if dinode.mode(IFDIR) {
-            self.cs_ndir(cg, -1);
+            self.add_ndir(cg, -1);
         }
 
-        self.cs_nifree(cg, 1);
+        self.add_nifree(cg, 1);
 
         trace!("dinode_free: csum={:?}", cg.cg_cs);
     }
@@ -1490,10 +1507,10 @@ impl Fs {
         trace!("dinode_alloc: csum={:?}", cg.cg_cs);
 
         if dinode.mode(IFDIR) {
-            self.cs_ndir(cg, 1);
+            self.add_ndir(cg, 1);
         }
 
-        self.cs_nifree(cg, -1);
+        self.add_nifree(cg, -1);
 
         let cgbuf = self.cgbuf_mut(buf, c);
         let cg: &Cg = unsafe { transmute(cgbuf.as_ptr()) };
@@ -1721,7 +1738,7 @@ impl Fs {
                         if remainfragsz > 0 {
                             cg.cg_frsum[remainfragsz] += 1;
                         }
-                        self.cs_nffree(cg, -1 * expandsz as i64);
+                        self.add_nffree(cg, -1 * expandsz as i64);
 
                         let blkbuf = self.blk0_mut(buf, blk);
                         (&mut blkbuf[osize as usize..nsize as usize]).fill(0);
@@ -1758,13 +1775,13 @@ impl Fs {
                     // accounting
                     let cgbuf = self.cgbuf_mut(buf, c);
                     let cg: &mut Cg = unsafe { transmute(cgbuf.as_mut_ptr()) };
-                    self.cs_nffree(cg, shirinksz as i64);
+                    self.add_nffree(cg, shirinksz as i64);
 
                     cg.cg_frsum[fragsz] -= 1;
                     if fragsz + shirinksz < self.fs_frag as usize {
                         cg.cg_frsum[fragsz + shirinksz] += 1;
                     } else {
-                        self.cs_nbfree(cg, 1);
+                        self.add_nbfree(cg, 1);
                     }
 
                     // TODO: fragment accounting
@@ -1775,12 +1792,21 @@ impl Fs {
         }
     }
 
-    fn dinode_realloc(&mut self, buf: &mut [u8], dinode: &mut Ufs2Dinode, size: i64) {
+    fn dinode_realloc(&mut self, buf: &mut [u8], dinode: &mut Ufs2Dinode, size: i64) -> bool {
         let osize = self.fragroundup(dinode.di_size as i64);
         let nsize = self.fragroundup(size);
 
         let mut ofrags = self.numfrags(osize);
         let nfrags = self.numfrags(nsize);
+
+        if nfrags > ofrags {
+            let maxblocks = howmany!(nfrags.0 - ofrags.0, self.fs_frag as i64);
+            let maxindblocks = howmany!(maxblocks, self.fs_nindir as i64) * 3;
+
+            if self.cs_nbfree() < maxblocks + maxindblocks {
+                return false;
+            }
+        }
 
         let fs_frag = FragIdx(self.fs_frag as i64);
 
@@ -1862,6 +1888,7 @@ impl Fs {
         }
 
         dinode.di_size = size as u64;
+        true
     }
 
     fn dir_read<'a>(
@@ -1966,7 +1993,13 @@ impl Fs {
         ret
     }
 
-    fn dir_append(&mut self, buf: &mut [u8], dinode: &mut Ufs2Dinode, direct: Direct, name: &[u8]) {
+    fn dir_append(
+        &mut self,
+        buf: &mut [u8],
+        dinode: &mut Ufs2Dinode,
+        direct: Direct,
+        name: &[u8],
+    ) -> bool {
         use AppendResult::*;
 
         loop {
@@ -1980,7 +2013,9 @@ impl Fs {
                 dinode
             );
             if dinode.di_blocks == 0 {
-                self.dinode_realloc(buf, dinode, DEV_BSIZE as i64);
+                if !self.dinode_realloc(buf, dinode, DEV_BSIZE as i64) {
+                    return false;
+                }
                 let mut blkbuf = self.inobuf_mut(buf, dinode, 0, DEV_BSIZE as i64);
                 direct_init(&mut blkbuf);
                 continue;
@@ -1995,11 +2030,13 @@ impl Fs {
             };
             let blkbuf = &mut self.blkat_mut(buf, &dinode, blkno)[..remain];
             match direct_append(blkbuf, 0, direct, name) {
-                InPlace(_) => return,
+                InPlace(_) => return true,
                 Failed => {
                     let size_prev = dinode.di_size;
                     let size_next = size_prev + DEV_BSIZE as u64;
-                    self.dinode_realloc(buf, dinode, size_next as i64);
+                    if !self.dinode_realloc(buf, dinode, size_next as i64) {
+                        return false;
+                    }
 
                     let mut blkbuf =
                         self.inobuf_mut(buf, dinode, size_prev as i64, DEV_BSIZE as i64);
@@ -2305,7 +2342,9 @@ impl<'a> FFS<'a> {
             if size > (1u64 << 32) - 1 {
                 return Err(libc::EFBIG);
             }
-            self.fs.dinode_realloc(self.buf, &mut dinode, size as i64);
+            if !self.fs.dinode_realloc(self.buf, &mut dinode, size as i64) {
+                return Err(libc::ENOSPC);
+            }
         }
         if let Some(atime) = atime {
             let d = match atime {
@@ -2388,8 +2427,12 @@ impl<'a> FFS<'a> {
             d_type: DT_REG,
             d_namlen: 0,
         };
-        self.fs
-            .dir_append(self.buf, &mut dinode_p, direct, name.as_bytes());
+        if !self
+            .fs
+            .dir_append(self.buf, &mut dinode_p, direct, name.as_bytes())
+        {
+            return Err(libc::ENOSPC);
+        }
 
         // update inode
         self.fs.dinode_update(self.buf, inumber, &dinode);
@@ -2430,32 +2473,8 @@ impl<'a> FFS<'a> {
         // allocate ino
         let inumber = self.fs.inode_alloc(self.buf, &dinode);
 
-        // default directory entry
-        self.fs.dir_append(
-            self.buf,
-            &mut dinode,
-            Direct {
-                d_ino: inumber.0 as u32,
-                d_reclen: 0,
-                d_type: DT_DIR,
-                d_namlen: 0,
-            },
-            ".".as_bytes(),
-        );
-        self.fs.dir_append(
-            self.buf,
-            &mut dinode,
-            Direct {
-                d_ino: parent.0 as u32,
-                d_reclen: 0,
-                d_type: DT_DIR,
-                d_namlen: 0,
-            },
-            "..".as_bytes(),
-        );
-
         // parent to child
-        self.fs.dir_append(
+        if !self.fs.dir_append(
             self.buf,
             &mut dinode_p,
             Direct {
@@ -2465,7 +2484,34 @@ impl<'a> FFS<'a> {
                 d_namlen: 0,
             },
             name.as_bytes(),
-        );
+        ) {
+            self.fs.dinode_free(&mut self.buf, inumber, dinode);
+            return Err(libc::ENOSPC);
+        }
+
+        // default directory entry
+        assert!(self.fs.dir_append(
+            self.buf,
+            &mut dinode,
+            Direct {
+                d_ino: inumber.0 as u32,
+                d_reclen: 0,
+                d_type: DT_DIR,
+                d_namlen: 0,
+            },
+            ".".as_bytes(),
+        ));
+        assert!(self.fs.dir_append(
+            self.buf,
+            &mut dinode,
+            Direct {
+                d_ino: parent.0 as u32,
+                d_reclen: 0,
+                d_type: DT_DIR,
+                d_namlen: 0,
+            },
+            "..".as_bytes(),
+        ));
 
         dinode_p.di_nlink += 1;
 
@@ -2584,8 +2630,13 @@ impl<'a> FFS<'a> {
             }
         }
 
-        self.fs
-            .dir_append(self.buf, &mut dinode_newp, direct, newname.as_bytes());
+        if !self
+            .fs
+            .dir_append(self.buf, &mut dinode_newp, direct, newname.as_bytes())
+        {
+            // TODO: restore the deleted entry
+            return Err(libc::ENOSPC);
+        }
 
         if parent != newparent {
             dinode_p.di_nlink -= 1;
@@ -2619,8 +2670,12 @@ impl<'a> FFS<'a> {
             d_type: DT_REG,
             d_namlen: 0,
         };
-        self.fs
-            .dir_append(self.buf, &mut dinode_p, direct, newname.as_bytes());
+        if !self
+            .fs
+            .dir_append(self.buf, &mut dinode_p, direct, newname.as_bytes())
+        {
+            return Err(libc::ENOSPC);
+        }
 
         dinode.di_nlink += 1;
         dinode_p.di_nlink += 1;
@@ -2873,7 +2928,7 @@ impl<'a> Filesystem for &mut FFS<'a> {
         let blkend = howmany!(end, self.fs.fs_bsize as i64);
 
         if end > dinode.di_size as i64 {
-            self.fs.dinode_realloc(self.buf, &mut dinode, end);
+            assert!(self.fs.dinode_realloc(self.buf, &mut dinode, end));
         }
 
         let mut written = 0;
