@@ -2237,7 +2237,11 @@ impl<'a> FFS<'a> {
     }
 
     fn check_name(&self, name: &str) -> Result<(), i32> {
-        if name.as_bytes().len() > MAXNAMLEN {
+        let len = name.as_bytes().len();
+        if len == 0 {
+            return Err(libc::EINVAL);
+        }
+        if len > MAXNAMLEN {
             return Err(libc::ENAMETOOLONG);
         }
         for ch in name.chars() {
