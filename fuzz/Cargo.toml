@@ -26,3 +26,9 @@ name = "fuzz_target_1"
 path = "fuzz_targets/fuzz_target_1.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "alloc"
+path = "fuzz_targets/alloc.rs"
+test = false
+doc = false
