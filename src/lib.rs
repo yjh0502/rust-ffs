@@ -2315,6 +2315,82 @@ impl<'a> FFS<'a> {
         Ok(dinode.fileattr(inumber.0))
     }
 
+    /// Create a directory.
+    pub fn mkdir0(&mut self, parent: u64, name: &str, mode: u32) -> Result<FileAttr, i32> {
+        self.check_ino(parent)?;
+        self.check_name(name)?;
+
+        let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d,
+            Err(_) => {
+                return Err(libc::ENOSYS);
+            }
+        };
+
+        let parent = Inumber(parent);
+        let mut dinode_p = self.fs.dinode(self.buf, parent);
+        if !dinode_p.mode(IFDIR) {
+            return Err(ENOTDIR);
+        }
+
+        if let Some(_) = self.fs.dir_lookup(self.buf, parent, name) {
+            return Err(EEXIST);
+        }
+
+        // make child directory
+        // allocate new dinode
+        let mut dinode = Ufs2Dinode::empty(d);
+        dinode.di_mode = IFDIR as u16 | (mode & 0xff) as u16;
+        dinode.di_nlink = 2;
+
+        // allocate ino
+        let inumber = self.fs.inode_alloc(self.buf, &dinode);
+
+        // default directory entry
+        self.fs.dir_append(
+            self.buf,
+            &mut dinode,
+            Direct {
+                d_ino: inumber.0 as u32,
+                d_reclen: 0,
+                d_type: DT_DIR,
+                d_namlen: 0,
+            },
+            ".".as_bytes(),
+        );
+        self.fs.dir_append(
+            self.buf,
+            &mut dinode,
+            Direct {
+                d_ino: parent.0 as u32,
+                d_reclen: 0,
+                d_type: DT_DIR,
+                d_namlen: 0,
+            },
+            "..".as_bytes(),
+        );
+
+        // parent to child
+        self.fs.dir_append(
+            self.buf,
+            &mut dinode_p,
+            Direct {
+                d_ino: inumber.0 as u32,
+                d_reclen: 0,
+                d_type: DT_DIR,
+                d_namlen: 0,
+            },
+            name.as_bytes(),
+        );
+
+        dinode_p.di_nlink += 1;
+
+        self.fs.dinode_update(self.buf, inumber, &dinode);
+        self.fs.dinode_update(self.buf, parent, &dinode_p);
+
+        Ok(dinode.fileattr(inumber.0))
+    }
+
     /// Remove a file.
     pub fn unlink0(&mut self, parent: u64, name: &str) -> Result<(), i32> {
         self.check_ino(parent)?;
@@ -2335,6 +2411,47 @@ impl<'a> FFS<'a> {
         } else {
             self.fs.dinode_update(self.buf, inumber, &dinode);
         }
+        Ok(())
+    }
+
+    /// Remove a directory.
+    pub fn rmdir0(&mut self, parent: u64, name: &str) -> Result<(), i32> {
+        self.check_ino(parent)?;
+        self.check_name(name)?;
+
+        let parent = Inumber(parent);
+        let mut dinode_p = self.fs.dinode(self.buf, parent);
+
+        let direct = match self.fs.dir_lookup(self.buf, parent, name) {
+            Some(direct) => direct,
+            None => {
+                return Err(libc::ENOENT);
+            }
+        };
+
+        let ino = Inumber(direct.d_ino as u64);
+        let dinode = self.fs.dinode(self.buf, ino);
+        if !dinode.mode(IFDIR) {
+            return Err(ENOTDIR);
+        }
+        if dinode.di_nlink > 2 {
+            return Err(ENOTEMPTY);
+        }
+
+        let data = self.fs.read(self.buf, &dinode);
+        if !direct_empty(&data, ino.0 as u32, parent.0 as u32) {
+            return Err(ENOTEMPTY);
+        }
+
+        if let None = self.fs.dir_delete(self.buf, parent, name) {
+            return Err(libc::ENOENT);
+        }
+
+        dinode_p.di_nlink -= 1;
+
+        self.fs.dinode_update(self.buf, parent, &dinode_p);
+        self.fs.dinode_free(self.buf, ino, dinode);
+
         Ok(())
     }
 }
@@ -2466,81 +2583,16 @@ impl<'a> Filesystem for &mut FFS<'a> {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(d) => d,
-            Err(_) => {
-                reply.error(libc::ENOSYS);
-                return;
-            }
-        };
-
-        let inumber_p = Inumber(parent + 1);
-        let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
-        info!("dinode_p={:?}", dinode_p);
-        if !dinode_p.mode(IFDIR) {
-            reply.error(ENOTDIR);
-            return;
-        }
-
         let name = name.to_str().unwrap();
-        if let Some(_) = self.fs.dir_lookup(self.buf, inumber_p, name) {
-            reply.error(EEXIST);
-            return;
+        match self.mkdir0(parent + 1, name, mode) {
+            Ok(mut attr) => {
+                attr.ino -= 1;
+                reply.entry(&TTL, &attr, attr.ino);
+            }
+            Err(e) => {
+                reply.error(e);
+            }
         }
-
-        // make child directory
-        // allocate new dinode
-        let mut dinode = Ufs2Dinode::empty(d);
-        dinode.di_mode = IFDIR as u16 | (mode & 0xff) as u16;
-        dinode.di_nlink = 2;
-
-        // allocate ino
-        let inumber = self.fs.inode_alloc(self.buf, &dinode);
-
-        // default directory entry
-        self.fs.dir_append(
-            self.buf,
-            &mut dinode,
-            Direct {
-                d_ino: inumber.0 as u32,
-                d_reclen: 0,
-                d_type: DT_DIR,
-                d_namlen: 0,
-            },
-            ".".as_bytes(),
-        );
-        self.fs.dir_append(
-            self.buf,
-            &mut dinode,
-            Direct {
-                d_ino: inumber_p.0 as u32,
-                d_reclen: 0,
-                d_type: DT_DIR,
-                d_namlen: 0,
-            },
-            "..".as_bytes(),
-        );
-
-        // parent to child
-        self.fs.dir_append(
-            self.buf,
-            &mut dinode_p,
-            Direct {
-                d_ino: inumber.0 as u32,
-                d_reclen: 0,
-                d_type: DT_DIR,
-                d_namlen: 0,
-            },
-            name.as_bytes(),
-        );
-
-        dinode_p.di_nlink += 1;
-
-        self.fs.dinode_update(self.buf, inumber, &dinode);
-        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
-
-        let ino = (inumber.0 - 1) as u64;
-        reply.entry(&TTL, &dinode.fileattr(ino), ino);
     }
 
     /// Remove a file.
@@ -2556,51 +2608,13 @@ impl<'a> Filesystem for &mut FFS<'a> {
 
     /// Remove a directory.
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        debug!(
-            "[Not Implemented] rmdir(parent: {:#x?}, name: {:?})",
-            parent, name,
-        );
-
-        let inumber_p = Inumber(parent + 1);
-        let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
-
         let name = name.to_str().unwrap();
-        let direct = match self.fs.dir_lookup(self.buf, inumber_p, name) {
-            Some(direct) => direct,
-            None => {
-                reply.error(ENOENT);
-                return;
+        match self.rmdir0(parent + 1, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                reply.error(e);
             }
-        };
-
-        let ino = Inumber(direct.d_ino as u64);
-        let dinode = self.fs.dinode(self.buf, ino);
-        if !dinode.mode(IFDIR) {
-            reply.error(ENOTDIR);
-            return;
         }
-        if dinode.di_nlink > 2 {
-            reply.error(ENOTEMPTY);
-            return;
-        }
-
-        let data = self.fs.read(self.buf, &dinode);
-        if !direct_empty(&data, ino.0 as u32, inumber_p.0 as u32) {
-            reply.error(ENOTEMPTY);
-            return;
-        }
-
-        if let None = self.fs.dir_delete(self.buf, inumber_p, name) {
-            reply.error(libc::ENOENT);
-            return;
-        }
-
-        dinode_p.di_nlink -= 1;
-
-        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
-        self.fs.dinode_free(self.buf, ino, dinode);
-
-        reply.ok();
     }
 
     /// Rename a file.
