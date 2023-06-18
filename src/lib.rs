@@ -2229,7 +2229,7 @@ impl<'a> FFS<'a> {
         dinode.fileattr(inumber.0)
     }
 
-    pub fn mknod(&mut self, parent: u64, name: &str, mode: u32) -> Result<u64, i32> {
+    pub fn mknod0(&mut self, parent: u64, name: &str, mode: u32) -> Result<FileAttr, i32> {
         let parent = Inumber(parent);
         let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => d,
@@ -2268,7 +2268,7 @@ impl<'a> FFS<'a> {
         self.fs.dinode_update(self.buf, inumber, &dinode);
         self.fs.dinode_update(self.buf, parent, &dinode_p);
 
-        Ok(inumber.0)
+        Ok(dinode.fileattr(inumber.0))
     }
 }
 
@@ -2384,50 +2384,16 @@ impl<'a> Filesystem for &mut FFS<'a> {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(d) => d,
-            Err(_) => {
-                reply.error(libc::ENOSYS);
-                return;
-            }
-        };
-
-        let inumber_p = Inumber(parent + 1);
-        let mut dinode_p = self.fs.dinode(self.buf, inumber_p);
-        info!("dinode_p={:?}", dinode_p);
-        if !dinode_p.mode(IFDIR) {
-            reply.error(ENOTDIR);
-            return;
-        }
         let name = name.to_str().unwrap();
-        if let Some(_) = self.fs.dir_lookup(self.buf, inumber_p, name) {
-            reply.error(EEXIST);
-            return;
+        match self.mknod0(parent + 1, name, mode) {
+            Ok(mut attr) => {
+                attr.ino -= 1;
+                reply.entry(&TTL, &attr, attr.ino);
+            }
+            Err(e) => {
+                reply.error(e);
+            }
         }
-
-        let mut dinode = Ufs2Dinode::empty(d);
-        dinode.di_mode = mode as u16;
-        dinode.di_nlink = 1;
-
-        // allocate ino
-        let inumber = self.fs.inode_alloc(self.buf, &dinode);
-
-        // update directory
-        let direct = Direct {
-            d_ino: inumber.0 as u32,
-            d_reclen: 0,
-            d_type: DT_REG,
-            d_namlen: 0,
-        };
-        self.fs
-            .dir_append(self.buf, &mut dinode_p, direct, name.as_bytes());
-
-        // update inode
-        self.fs.dinode_update(self.buf, inumber, &dinode);
-        self.fs.dinode_update(self.buf, inumber_p, &dinode_p);
-
-        let ino = (inumber.0 - 1) as u64;
-        reply.entry(&TTL, &dinode.fileattr(ino), ino);
     }
 
     /// Create a directory.
