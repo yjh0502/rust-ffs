@@ -8,6 +8,7 @@ use crate::consts::*;
 
 // dir.h
 pub const MAXDIRSIZE: usize = 0x7fffffff;
+pub const MAXNAMLEN: usize = 255;
 
 pub const DIR_ROUNDUP: usize = 4;
 pub fn directsiz(len: u8) -> usize {

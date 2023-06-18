@@ -2237,6 +2237,9 @@ impl<'a> FFS<'a> {
         if parent >= self.fs.fs_ipg as u64 * self.fs.fs_ncg as u64 {
             return Err(libc::EINVAL);
         }
+        if name.as_bytes().len() > MAXNAMLEN {
+            return Err(libc::ENAMETOOLONG);
+        }
 
         let parent = Inumber(parent);
         let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
