@@ -1903,8 +1903,9 @@ impl Fs {
 
     fn dir_delete(&self, buf: &mut [u8], inumber_p: Inumber, name: &str) -> Option<Direct> {
         let dinode_p = self.dinode(buf, inumber_p);
-
-        assert!(dinode_p.mode(IFDIR));
+        if !dinode_p.mode(IFDIR) {
+            return None;
+        }
 
         let mut ret = None;
         let mut blkbuf_out = Vec::with_capacity(self.fs_bsize as usize);
@@ -2223,22 +2224,54 @@ pub struct FFS<'a> {
 }
 
 impl<'a> FFS<'a> {
+    fn check_ino(&self, ino: u64) -> Result<(), i32> {
+        if ino >= self.fs.fs_ipg as u64 * self.fs.fs_ncg as u64 {
+            return Err(libc::EINVAL);
+        }
+        Ok(())
+    }
+
+    fn check_name(&self, name: &str) -> Result<(), i32> {
+        if name.as_bytes().len() > MAXNAMLEN {
+            return Err(libc::ENAMETOOLONG);
+        }
+        for ch in name.chars() {
+            if ch == '\0' || ch == '/' {
+                return Err(libc::EINVAL);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn getattr(&mut self, inumber: u64) -> FileAttr {
         let inumber = Inumber(inumber);
         let dinode = self.fs.dinode(self.buf, inumber);
         dinode.fileattr(inumber.0)
     }
 
+    pub fn lookup0(&mut self, parent: u64, name: &str) -> Result<FileAttr, i32> {
+        self.check_ino(parent)?;
+        self.check_name(name)?;
+
+        let parent = Inumber(parent);
+        match self.fs.dir_lookup(self.buf, parent, name) {
+            Some(direct) => {
+                let inumber = Inumber(direct.d_ino as u64);
+                let dinode = self.fs.dinode(self.buf, inumber);
+
+                Ok(dinode.fileattr(inumber.0))
+            }
+            None => Err(ENOENT),
+        }
+    }
+
     pub fn mknod0(&mut self, parent: u64, name: &str, mode: u32) -> Result<FileAttr, i32> {
-        let mode_fmt = mode & IFMT as u32;
-        if mode_fmt != IFREG as u32 {
+        self.check_ino(parent)?;
+        self.check_name(name)?;
+
+        if mode & IFMT as u32 != IFREG as u32 {
             return Err(libc::EINVAL);
-        }
-        if parent >= self.fs.fs_ipg as u64 * self.fs.fs_ncg as u64 {
-            return Err(libc::EINVAL);
-        }
-        if name.as_bytes().len() > MAXNAMLEN {
-            return Err(libc::ENAMETOOLONG);
         }
 
         let parent = Inumber(parent);
@@ -2281,28 +2314,44 @@ impl<'a> FFS<'a> {
 
         Ok(dinode.fileattr(inumber.0))
     }
+
+    /// Remove a file.
+    pub fn unlink0(&mut self, parent: u64, name: &str) -> Result<(), i32> {
+        self.check_ino(parent)?;
+
+        let parent = Inumber(parent);
+        let inumber = match self.fs.dir_delete(self.buf, parent, name) {
+            Some(direct) => Inumber(direct.d_ino as u64),
+            None => {
+                return Err(libc::ENOENT);
+            }
+        };
+
+        let mut dinode = self.fs.dinode(self.buf, inumber);
+        dinode.di_nlink -= 1;
+
+        if dinode.di_nlink == 0 {
+            self.fs.dinode_free(self.buf, inumber, dinode);
+        } else {
+            self.fs.dinode_update(self.buf, inumber, &dinode);
+        }
+        Ok(())
+    }
 }
 
 impl<'a> Filesystem for &mut FFS<'a> {
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        info!("lookup: parent={}, name={:?}", parent, name);
-
-        let inumber_p = Inumber(parent + 1);
         let name = name.to_str().unwrap();
-        let direct = match self.fs.dir_lookup(self.buf, inumber_p, name) {
-            Some(direct) => direct,
-            None => {
-                reply.error(ENOENT);
-                return;
+        match self.lookup0(parent + 1, name) {
+            Ok(mut attr) => {
+                attr.ino -= 1;
+                reply.entry(&TTL, &attr, attr.ino);
             }
-        };
-
-        let inumber = Inumber(direct.d_ino as u64);
-        let dinode = self.fs.dinode(self.buf, inumber);
-
-        let ino = inumber.0 - 1;
-        reply.entry(&TTL, &dinode.fileattr(ino), ino);
+            Err(e) => {
+                reply.error(e);
+            }
+        }
     }
 
     /// Get file attributes.
@@ -2496,27 +2545,13 @@ impl<'a> Filesystem for &mut FFS<'a> {
 
     /// Remove a file.
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let inumber_p = Inumber(parent + 1);
-
         let name = name.to_str().unwrap();
-        let inumber = match self.fs.dir_delete(self.buf, inumber_p, name) {
-            Some(direct) => Inumber(direct.d_ino as u64),
-            None => {
-                reply.error(libc::ENOENT);
-                return;
+        match self.unlink0(parent + 1, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                reply.error(e);
             }
-        };
-
-        let mut dinode = self.fs.dinode(self.buf, inumber);
-        dinode.di_nlink -= 1;
-
-        if dinode.di_nlink == 0 {
-            self.fs.dinode_free(self.buf, inumber, dinode);
-        } else {
-            self.fs.dinode_update(self.buf, inumber, &dinode);
         }
-
-        reply.ok();
     }
 
     /// Remove a directory.
