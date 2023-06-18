@@ -2272,11 +2272,11 @@ pub struct FFS<'a> {
 }
 
 impl<'a> FFS<'a> {
-    fn check_ino(&self, ino: u64) -> Result<(), i32> {
+    fn check_ino(&self, ino: u64) -> Result<Inumber, i32> {
         if ino >= self.fs.fs_ipg as u64 * self.fs.fs_ncg as u64 {
             return Err(libc::EINVAL);
         }
-        Ok(())
+        Ok(Inumber(ino))
     }
 
     fn check_name(&self, name: &str) -> Result<(), i32> {
@@ -2304,10 +2304,14 @@ impl<'a> FFS<'a> {
         }
     }
 
-    pub fn getattr0(&mut self, inumber: u64) -> FileAttr {
-        let inumber = Inumber(inumber);
+    pub fn getattr0(&mut self, inumber: u64) -> Result<FileAttr, i32> {
+        let inumber = self.check_ino(inumber)?;
         let dinode = self.fs.dinode(self.buf, inumber);
-        dinode.fileattr(inumber.0)
+        if dinode.di_mode == 0 {
+            return Err(ENOENT);
+        }
+
+        Ok(dinode.fileattr(inumber.0))
     }
 
     /// Set file attributes.
@@ -2323,9 +2327,7 @@ impl<'a> FFS<'a> {
         ctime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> Result<FileAttr, i32> {
-        self.check_ino(ino)?;
-
-        let ino = Inumber(ino);
+        let ino = self.check_ino(ino)?;
         let mut dinode = self.fs.dinode(self.buf, ino);
 
         if let Some(mode) = mode {
@@ -2376,10 +2378,9 @@ impl<'a> FFS<'a> {
     }
 
     pub fn lookup0(&mut self, parent: u64, name: &str) -> Result<FileAttr, i32> {
-        self.check_ino(parent)?;
+        let parent = self.check_ino(parent)?;
         self.check_name(name)?;
 
-        let parent = Inumber(parent);
         match self.fs.dir_lookup(self.buf, parent, name) {
             Some(direct) => {
                 let inumber = Inumber(direct.d_ino as u64);
@@ -2392,11 +2393,10 @@ impl<'a> FFS<'a> {
     }
 
     pub fn mknod0(&mut self, parent: u64, name: &str, mode: u32) -> Result<FileAttr, i32> {
-        self.check_ino(parent)?;
+        let parent = self.check_ino(parent)?;
         self.check_name(name)?;
         self.check_if(mode, IFREG)?;
 
-        let parent = Inumber(parent);
         let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => d,
             Err(_) => {
@@ -2443,7 +2443,7 @@ impl<'a> FFS<'a> {
 
     /// Create a directory.
     pub fn mkdir0(&mut self, parent: u64, name: &str, mode: u32) -> Result<FileAttr, i32> {
-        self.check_ino(parent)?;
+        let parent = self.check_ino(parent)?;
         self.check_name(name)?;
         self.check_if(mode, IFDIR)?;
 
@@ -2454,7 +2454,6 @@ impl<'a> FFS<'a> {
             }
         };
 
-        let parent = Inumber(parent);
         let mut dinode_p = self.fs.dinode(self.buf, parent);
         if !dinode_p.mode(IFDIR) {
             return Err(ENOTDIR);
@@ -2523,9 +2522,8 @@ impl<'a> FFS<'a> {
 
     /// Remove a file.
     pub fn unlink0(&mut self, parent: u64, name: &str) -> Result<(), i32> {
-        self.check_ino(parent)?;
+        let parent = self.check_ino(parent)?;
 
-        let parent = Inumber(parent);
         let inumber = match self.fs.dir_delete(self.buf, parent, name) {
             Some(direct) => Inumber(direct.d_ino as u64),
             None => {
@@ -2546,10 +2544,9 @@ impl<'a> FFS<'a> {
 
     /// Remove a directory.
     pub fn rmdir0(&mut self, parent: u64, name: &str) -> Result<(), i32> {
-        self.check_ino(parent)?;
+        let parent = self.check_ino(parent)?;
         self.check_name(name)?;
 
-        let parent = Inumber(parent);
         let mut dinode_p = self.fs.dinode(self.buf, parent);
 
         let direct = match self.fs.dir_lookup(self.buf, parent, name) {
@@ -2593,13 +2590,11 @@ impl<'a> FFS<'a> {
         newparent: u64,
         newname: &str,
     ) -> Result<(), i32> {
-        self.check_ino(parent)?;
-        self.check_ino(newparent)?;
+        let parent = self.check_ino(parent)?;
+        let newparent = self.check_ino(newparent)?;
         self.check_name(name)?;
         self.check_name(newname)?;
 
-        let parent = Inumber(parent);
-        let newparent = Inumber(newparent);
         let mut dinode_p = self.fs.dinode(self.buf, parent);
         let mut dinode_newp = self.fs.dinode(self.buf, newparent);
 
@@ -2651,12 +2646,9 @@ impl<'a> FFS<'a> {
 
     /// Create a hard link.
     pub fn link0(&mut self, ino: u64, newparent: u64, newname: &str) -> Result<FileAttr, i32> {
-        self.check_ino(ino)?;
-        self.check_ino(newparent)?;
+        let ino = self.check_ino(ino)?;
+        let newparent = self.check_ino(newparent)?;
         self.check_name(newname)?;
-
-        let ino = Inumber(ino);
-        let newparent = Inumber(newparent);
 
         let mut dinode = self.fs.dinode(self.buf, ino);
         let mut dinode_p = self.fs.dinode(self.buf, newparent);
@@ -2703,16 +2695,15 @@ impl<'a> Filesystem for &mut FFS<'a> {
 
     /// Get file attributes.
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        let inumber = Inumber(ino + 1);
-        info!("getattr: ino={}", ino);
-
-        let dinode = self.fs.dinode(self.buf, inumber);
-        if dinode.di_mode == 0 {
-            reply.error(ENOENT);
-            return;
+        match self.getattr0(ino + 1) {
+            Ok(mut attr) => {
+                attr.ino -= 1;
+                reply.attr(&TTL, &attr);
+            }
+            Err(e) => {
+                reply.error(e);
+            }
         }
-
-        reply.attr(&TTL, &dinode.fileattr(ino));
     }
 
     /// Set file attributes.
