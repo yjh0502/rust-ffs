@@ -2230,6 +2230,14 @@ impl<'a> FFS<'a> {
     }
 
     pub fn mknod0(&mut self, parent: u64, name: &str, mode: u32) -> Result<FileAttr, i32> {
+        let mode_fmt = mode & IFMT as u32;
+        if mode_fmt != IFREG as u32 {
+            return Err(libc::EINVAL);
+        }
+        if parent >= self.fs.fs_ipg as u64 * self.fs.fs_ncg as u64 {
+            return Err(libc::EINVAL);
+        }
+
         let parent = Inumber(parent);
         let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => d,
