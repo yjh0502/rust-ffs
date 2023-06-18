@@ -1858,11 +1858,15 @@ impl Fs {
         dinode.di_size = size as u64;
     }
 
-    fn dir_read<'a>(&'a self, buf: &'a [u8], ino: Inumber) -> Vec<(&'a Direct, &'a str)> {
+    fn dir_read<'a>(
+        &'a self,
+        buf: &'a [u8],
+        ino: Inumber,
+    ) -> Result<Vec<(&'a Direct, &'a str)>, i32> {
         let dinode = self.dinode(buf, ino);
-        trace!("dir_read: dinode={:?}", dinode);
-
-        assert!(dinode.mode(IFDIR));
+        if !dinode.mode(IFDIR) {
+            return Err(libc::ENOTDIR);
+        }
 
         let mut out = Vec::new();
         let mut read = 0;
@@ -1876,13 +1880,14 @@ impl Fs {
             read += blkbuf.len();
         }
 
-        out
+        Ok(out)
     }
 
     fn dir_lookup(&self, buf: &mut [u8], inumber_p: Inumber, name: &str) -> Option<Direct> {
         let dinode = self.dinode(buf, inumber_p);
-
-        assert!(dinode.mode(IFDIR));
+        if !dinode.mode(IFDIR) {
+            return None;
+        }
 
         let mut read = 0;
         while read < dinode.di_size as usize {
@@ -2244,6 +2249,14 @@ impl<'a> FFS<'a> {
         Ok(())
     }
 
+    fn check_if(&self, mode: u32, expected: usize) -> Result<(), i32> {
+        if mode & IFMT as u32 != expected as u32 {
+            Err(libc::EINVAL)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn getattr(&mut self, inumber: u64) -> FileAttr {
         let inumber = Inumber(inumber);
         let dinode = self.fs.dinode(self.buf, inumber);
@@ -2269,10 +2282,7 @@ impl<'a> FFS<'a> {
     pub fn mknod0(&mut self, parent: u64, name: &str, mode: u32) -> Result<FileAttr, i32> {
         self.check_ino(parent)?;
         self.check_name(name)?;
-
-        if mode & IFMT as u32 != IFREG as u32 {
-            return Err(libc::EINVAL);
-        }
+        self.check_if(mode, IFREG)?;
 
         let parent = Inumber(parent);
         let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -2319,6 +2329,7 @@ impl<'a> FFS<'a> {
     pub fn mkdir0(&mut self, parent: u64, name: &str, mode: u32) -> Result<FileAttr, i32> {
         self.check_ino(parent)?;
         self.check_name(name)?;
+        self.check_if(mode, IFDIR)?;
 
         let d = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => d,
@@ -2840,7 +2851,13 @@ impl<'a> Filesystem for &mut FFS<'a> {
 
         let inumber = Inumber(ino + 1);
 
-        let directs = self.fs.dir_read(self.buf, inumber);
+        let directs = match self.fs.dir_read(self.buf, inumber) {
+            Ok(directs) => directs,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
 
         for (i, (direct, name)) in directs.into_iter().enumerate() {
             if i < offset as usize {
@@ -2880,7 +2897,13 @@ impl<'a> Filesystem for &mut FFS<'a> {
 
         let inumber = ino + 1;
 
-        let directs = self.fs.dir_read(self.buf, Inumber(inumber as u64));
+        let directs = match self.fs.dir_read(self.buf, Inumber(inumber as u64)) {
+            Ok(directs) => directs,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
 
         for (i, (direct, name)) in directs.into_iter().enumerate() {
             if i <= offset as usize {
