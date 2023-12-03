@@ -11,10 +11,10 @@ argh = "0.1.10"
 derive_more = "0.99.17"
 env_logger = "0.10.0"
 fuse = "0.3.1"
-fuser = "0.12.0"
+fuser = "0.14.0"
 libc = "0.2.143"
 log = "0.4.17"
-memmap2 = "0.7"
+memmap2 = "0.9"
 memoffset = "0.9"
 
 [profile.release]
