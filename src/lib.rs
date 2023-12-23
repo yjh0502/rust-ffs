@@ -2595,6 +2595,10 @@ impl<'a> FFS<'a> {
         self.check_name(name)?;
         self.check_name(newname)?;
 
+        if parent == newparent || name == newname {
+            return Err(libc::EINVAL);
+        }
+
         let mut dinode_p = self.fs.dinode(self.buf, parent);
         let mut dinode_newp = self.fs.dinode(self.buf, newparent);
 
